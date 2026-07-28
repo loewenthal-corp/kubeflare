@@ -1,0 +1,45 @@
+{
+  // kubeflare — a real Kubernetes cluster on a Cloudflare Container.
+  //
+  //   npm install && ./scripts/deploy.sh
+  //
+  // No account ID here on purpose: wrangler uses whichever account you are logged
+  // into. If you belong to several, set CLOUDFLARE_ACCOUNT_ID in your environment.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kubeflare",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "observability": { "enabled": true },
+
+  "vars": {
+    // flannel's default vxlan backend cannot start here — the Cloudflare kernel
+    // has no vxlan device. host-gw needs none. See docs/FINDINGS.md.
+    "FLANNEL_BACKEND": "host-gw",
+    // "nftables" or "iptables". Neither can program Services on the current
+    // kernel; nftables just fails quietly instead of looping on errors.
+    "KUBE_PROXY_MODE": "nftables",
+    // Only needed if you wire up a Cloudflare Tunnel (docs/TUNNEL.md). It is
+    // added to the apiserver certificate's SANs.
+    "TUNNEL_HOSTNAME": ""
+  },
+
+  "containers": [
+    {
+      "class_name": "KubeFlare",
+      "image": "./container/Dockerfile",
+      "max_instances": 1,
+      // 2 vCPU / 8 GiB / 16 GB. Constraints: >= 3 GiB memory per vCPU, and
+      // <= 2 GB disk per GiB memory. containerd needs the disk to unpack images.
+      "instance_type": { "vcpu": 2, "memory_mib": 8192, "disk_mb": 16000 }
+
+      // To SSH into the running container, add your own public key:
+      // "authorized_keys": [{ "name": "me", "public_key": "ssh-ed25519 AAAA..." }]
+      // then: npx wrangler containers ssh <INSTANCE_ID>
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "KUBEFLARE", "class_name": "KubeFlare" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KubeFlare"] }]
+}

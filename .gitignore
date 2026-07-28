@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+.dev.vars
+
+# Credentials — kubeconfig.yaml embeds a cluster-admin token
+kubeconfig.yaml
+tunnel-kubeconfig.yaml
+*.token
+*_ed25519
+*.pem
+
+.DS_Store
+*.log
+.kubeflare-token

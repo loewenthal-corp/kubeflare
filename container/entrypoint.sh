@@ -29,6 +29,38 @@ done
 modprobe br_netfilter 2>>"$LOG_DIR/entrypoint.log" && log "br_netfilter loaded" || log "br_netfilter not loadable (ok on single node)"
 sysctl -w net.bridge.bridge-nf-call-iptables=1 >>"$LOG_DIR/entrypoint.log" 2>&1 || true
 
+# Keep pods away from the unauthenticated control-plane ports on the host.
+#
+# This closes a real privilege escalation. `kubectl proxy` (:8001) holds the
+# node's cluster-admin kubeconfig and authenticates nobody — the Worker in front
+# of it is the only gate. The status server (:8080) serves /kubeconfig and
+# /logs, equally ungated. Both bind 0.0.0.0, and svcproxy's AnyIP route makes
+# the whole service CIDR host-local, so before these rules a pod could reach
+# cluster-admin at 10.0.0.1:8001 *or at any 10.43.x.x:8001* — no token, no
+# ServiceAccount, RBAC bypassed entirely. Confirmed by reading every kube-system
+# Secret and minting ServiceAccount tokens from an unprivileged busybox pod.
+#
+# Matching on -i cni0 rather than a source CIDR so a pod cannot spoof its way
+# out. The Worker's traffic arrives on the external interface, not cni0, so the
+# real API path is unaffected.
+#
+# Nothing that worked is lost: because these ports are bound on 0.0.0.0, a
+# Service on 8001 or 8080 could never be bound by svcproxy anyway. The proper
+# fix is to bind both listeners to the node IP only (as coredns already does,
+# which is why the kube-dns ClusterIP on :53 works) — that needs the Cloudflare
+# readiness path re-verified, so it is deliberately not done here.
+harden_local_ports() {
+  for p in 8001 8080; do
+    iptables -C INPUT -i cni0 -p tcp --dport "$p" -j DROP 2>/dev/null \
+      || iptables -I INPUT -i cni0 -p tcp --dport "$p" -j DROP 2>/dev/null
+  done
+}
+# cni0 does not exist yet — flannel creates it after k3s starts. iptables
+# accepts a rule naming an absent interface and matches once it appears, and the
+# supervisor re-asserts these anyway.
+harden_local_ports && log "pod->host :8001/:8080 blocked (cluster-admin proxy, dashboard)" \
+  || log "WARNING: could not install INPUT guards for :8001/:8080"
+
 NODE_NAME="${NODE_NAME:-cf-$(hostname)}"
 TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-}"
 
@@ -318,6 +350,42 @@ fi
 # NodeLocal DNSCache does the same thing upstream with a link-local address.
 NET_ARGS+=(--kubelet-arg=cluster-dns="$NODE_IP")
 
+# ---------------------------------------------------------------- image mirror
+# Point containerd at the R2-backed pull-through registry (the separate
+# kubeflare-registry Worker) instead of Docker Hub. This has to be written
+# BEFORE k3s starts: k3s renders containerd's config from registries.yaml once,
+# at startup.
+#
+# Why it matters here specifically: every cold wake starts with an empty
+# containerd store, so the images are pulled again from scratch. Serving them
+# from R2 is faster, free (no R2 egress fee), and immune to Docker Hub's
+# anonymous per-IP rate limit — which a shared-egress puller hits constantly.
+#
+# containerd always appends the default upstream endpoint after the mirrors, so
+# an unreachable or misconfigured mirror degrades to a slow pull, not a broken
+# cluster. That is why this is best-effort and never fatal.
+if [ -n "${REGISTRY_MIRROR_URL:-}" ]; then
+  mirror_host="${REGISTRY_MIRROR_URL#https://}"; mirror_host="${mirror_host#http://}"
+  mkdir -p /etc/rancher/k3s
+  {
+    echo "mirrors:"
+    echo "  docker.io:"
+    echo "    endpoint:"
+    echo "      - \"$REGISTRY_MIRROR_URL\""
+    if [ -n "${REGISTRY_MIRROR_USERNAME:-}" ] && [ -n "${REGISTRY_MIRROR_PASSWORD:-}" ]; then
+      echo "configs:"
+      echo "  \"$mirror_host\":"
+      echo "    auth:"
+      echo "      username: \"$REGISTRY_MIRROR_USERNAME\""
+      echo "      password: \"$REGISTRY_MIRROR_PASSWORD\""
+    fi
+  } > /etc/rancher/k3s/registries.yaml
+  chmod 600 /etc/rancher/k3s/registries.yaml
+  log "image mirror: docker.io -> $mirror_host (auth: $([ -n "${REGISTRY_MIRROR_USERNAME:-}" ] && echo yes || echo no))"
+else
+  log "no REGISTRY_MIRROR_URL, pulling images straight from Docker Hub"
+fi
+
 # ---------------------------------------------------------------- k3s
 start_k3s() {
   log "starting k3s server (node=$NODE_NAME, flannel=$FLANNEL_BACKEND, litestream=${LITESTREAM_ENABLED:-no}, juicefs=${JUICEFS_MOUNTED:-no})"
@@ -495,6 +563,10 @@ trap term SIGTERM SIGINT
 while true; do
   sleep 10 &
   wait -n $! 2>/dev/null
+  # Re-assert the pod->host port guards. They are installed before cni0 exists,
+  # and a k3s restart or any CNI teardown can take the chain with it; an
+  # idempotent -C/-I costs nothing and losing them means losing cluster-admin.
+  harden_local_ports
   if ! kill -0 "$K3S_PID" 2>/dev/null; then
     log "k3s exited (see k3s.log); restarting in 10s"
     sleep 10

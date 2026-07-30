@@ -1,0 +1,270 @@
+# kubeflare showcase -- a realistic multi-feature app, on real Kubernetes, on a
+# Cloudflare Container.
+#
+#   kubectl apply -f conformance/showcase.yaml
+#   kubectl -n kubeflare-showcase get all,pvc,ingress
+#
+# See conformance/README.md ("What to look at in the showcase") for the guided tour.
+# Everything here is verified working on this cluster. Deliberately NOT included:
+# HorizontalPodAutoscaler (no metrics-server), NodePort/LoadBalancer (no inbound
+# TCP), and NetworkPolicy (accepted but not enforced -- see docs/CONFORMANCE.md).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubeflare-showcase
+---
+# The app runs under its own ServiceAccount, and is granted only the ability to read
+# ConfigMaps in its own namespace. The sidecar below uses this identity to call the
+# apiserver through kubernetes.default, which works via svcproxy.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: showcase
+  namespace: kubeflare-showcase
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: showcase-config-reader
+  namespace: kubeflare-showcase
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: showcase-config-reader
+  namespace: kubeflare-showcase
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: showcase-config-reader
+subjects:
+  - kind: ServiceAccount
+    name: showcase
+    namespace: kubeflare-showcase
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: showcase-config
+  namespace: kubeflare-showcase
+data:
+  GREETING: hello from kubeflare
+  TIER: showcase
+  # Mounted at a subPath, so it lands as a single file rather than a directory.
+  index.html: |
+    <!doctype html>
+    <title>kubeflare showcase</title>
+    <h1>kubeflare showcase</h1>
+    <p>Served by nginx from a ConfigMap subPath mount, on k3s in a Firecracker
+       microVM on Cloudflare Containers.</p>
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: showcase-secret
+  namespace: kubeflare-showcase
+type: Opaque
+stringData:
+  API_TOKEN: not-a-real-token
+---
+# RWO volume from the vendored local-path provisioner. Bound on first consumer.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: showcase-data
+  namespace: kubeflare-showcase
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 128Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: showcase
+  namespace: kubeflare-showcase
+  labels: {app: showcase}
+spec:
+  # 2 replicas so the Service has something to round-robin across. Note that both
+  # land on the single node -- pod anti-affinity would leave the second Pending.
+  replicas: 2
+  selector:
+    matchLabels: {app: showcase}
+  template:
+    metadata:
+      labels: {app: showcase}
+    spec:
+      serviceAccountName: showcase
+      terminationGracePeriodSeconds: 20
+      initContainers:
+        # 1) Ordinary init container: runs to completion before anything else.
+        - name: seed-content
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "seeded at $(date -u +%FT%TZ) by $HOSTNAME" > /data/seeded.txt
+              echo "init container finished"
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+        # 2) NATIVE SIDECAR: an initContainer with restartPolicy: Always. It starts
+        #    before the main container, then keeps running for the pod's lifetime.
+        #    This is the k8s >=1.29 sidecar pattern, and it works here.
+        - name: sidecar-apiwatch
+          image: registry.k8s.io/e2e-test-images/agnhost:2.47
+          restartPolicy: Always
+          args: [inclusterclient, --poll-interval=15]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - {name: http, containerPort: 80}
+          env:
+            # ConfigMap and Secret as individual env vars...
+            - name: GREETING
+              valueFrom: {configMapKeyRef: {name: showcase-config, key: GREETING}}
+            - name: API_TOKEN
+              valueFrom: {secretKeyRef: {name: showcase-secret, key: API_TOKEN}}
+            # ...and the downward API.
+            - name: MY_POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: MY_POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: MY_NODE
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          envFrom:
+            # Whole-ConfigMap projection: brings in TIER.
+            - configMapRef: {name: showcase-config}
+          volumeMounts:
+            # subPath: mount one ConfigMap key as a single file.
+            - name: config
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+            - {name: data, mountPath: /data}
+            - {name: cache, mountPath: /var/cache/nginx}
+            # Projected volume: ConfigMap + Secret + downward API + a bound
+            # ServiceAccount token, all under one mount point.
+            - {name: projected, mountPath: /etc/showcase, readOnly: true}
+          # Burstable QoS: requests < limits.
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+          startupProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: [sh, -c, "nginx -s quit; sleep 2"]
+      volumes:
+        - name: config
+          configMap: {name: showcase-config}
+        - name: data
+          persistentVolumeClaim: {claimName: showcase-data}
+        - name: cache
+          emptyDir: {}
+        - name: projected
+          projected:
+            sources:
+              - configMap:
+                  name: showcase-config
+                  items: [{key: TIER, path: tier}]
+              - secret:
+                  name: showcase-secret
+                  items: [{key: API_TOKEN, path: api-token}]
+              - downwardAPI:
+                  items:
+                    - path: labels
+                      fieldRef: {fieldPath: metadata.labels}
+              - serviceAccountToken:
+                  path: token
+                  audience: showcase
+                  expirationSeconds: 3600
+---
+# ClusterIP Service. Works without kube-proxy, via svcproxy.
+apiVersion: v1
+kind: Service
+metadata:
+  name: showcase
+  namespace: kubeflare-showcase
+spec:
+  type: ClusterIP
+  selector: {app: showcase}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+# Headless Service: DNS returns every ready pod IP instead of one virtual IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: showcase-headless
+  namespace: kubeflare-showcase
+spec:
+  clusterIP: None
+  selector: {app: showcase}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+# Keeps at least one replica available against voluntary disruption. The eviction
+# subresource honours this.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: showcase
+  namespace: kubeflare-showcase
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: showcase}
+---
+# A CronJob that talks to the Service every minute, proving in-cluster DNS and
+# ClusterIP routing keep working over time.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: showcase-poller
+  namespace: kubeflare-showcase
+spec:
+  schedule: "*/1 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: poll
+              image: busybox:1.36
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  echo "resolving showcase.kubeflare-showcase.svc.cluster.local"
+                  nslookup showcase.kubeflare-showcase.svc.cluster.local || true
+                  echo "fetching through the ClusterIP"
+                  wget -q -T10 -O- http://showcase.kubeflare-showcase.svc.cluster.local/ | head -3
+                  echo "poll OK"
+              resources:
+                requests: {cpu: 10m, memory: 16Mi}

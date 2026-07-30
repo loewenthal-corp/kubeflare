@@ -30,7 +30,13 @@
     // to leave R2-backed PersistentVolumes off; it is off regardless unless
     // durable state is enabled. Do not point it at R2_BUCKET — JuiceFS refuses
     // to initialise a volume whose bucket already has objects in it.
-    "R2_BUCKET_JFS": "kubeflare-jfs"
+    "R2_BUCKET_JFS": "kubeflare-jfs",
+    // R2-backed pull-through image cache: the separate kubeflare-registry
+    // Worker (cloudflare/serverless-registry). containerd mirrors docker.io to
+    // it, and always keeps the real upstream as a fallback, so a broken mirror
+    // makes pulls slow rather than impossible. Set to "" to pull from Docker Hub
+    // directly. The read-only credentials are Worker secrets.
+    "REGISTRY_MIRROR_URL": "https://kubeflare-registry.the-loewenthal-corporation.workers.dev"
   },
 
   "containers": [

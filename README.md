@@ -62,7 +62,11 @@ export KUBECONFIG=$PWD/kubeconfig.yaml
 kubectl get nodes -o wide
 ```
 
-Cold start takes about 90 seconds. `./scripts/teardown.sh --yes` removes everything.
+Cold start takes about 90 seconds; a *restore* from R2 is closer to 30. `./scripts/teardown.sh --yes` removes everything.
+
+The node is named `cf-<hostname>` on an ephemeral cluster and `kubeflare` once durable
+state is on, because a restored cluster has to re-adopt its own Node object and
+container hostnames are not stable across instances.
 
 ## What works
 
@@ -74,6 +78,9 @@ Cold start takes about 90 seconds. `./scripts/teardown.sh --yes` removes everyth
 - **Cluster DNS.** A vendored coredns runs on the host network and kubelet hands pods the node IP as their nameserver, so DNS works before (and independently of) svcproxy. The `kube-dns` ClusterIP works too, for charts that hardcode it.
 - **PersistentVolumeClaims**, two flavours. A vendored local-path-provisioner (apiserver reached via the node IP) serves RWO volumes on the ephemeral node disk, and — when you turn it on — RWX volumes on a JuiceFS filesystem whose data lives in R2 and survives the disk. See [R2-backed volumes](#r2-backed-volumes-juicefs).
 - **`kubectl exec`, `attach`, `port-forward`, `cp`** — over the WebSocket transport that has been kubectl's default since 1.31, straight through the Worker. No tunnel required.
+- **`kubectl top` and HorizontalPodAutoscalers**, via a vendored metrics-server. It was only ever disabled because the aggregation layer needs a working ClusterIP.
+- **Admission webhooks**, including your own — the apiserver reaches a webhook's ClusterIP through svcproxy. This is what makes operators and Crossplane installable.
+- Most of the API surface, measured rather than assumed: 153 features work across 175 checks. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 - `kubectl` from anywhere: get, create, apply, scale, delete, logs, describe, rollout.
 - Self-healing. A supervisor restarts k3s if it dies, and after a disk wipe the cluster rebuilds itself unattended — or restores itself from R2 if durable state is on.
 
@@ -84,11 +91,21 @@ Every entry below is a kernel gap, and the kernel takes no modules: there is no 
 | Broken | Root cause |
 |---|---|
 | kube-proxy, all four backends | this kernel is missing something for each one (below) — worked around in userspace, see `svcproxy/` |
+| **NetworkPolicy — silently does nothing** | kube-router emits `-j NFLOG` per pod chain and the kernel has no `xt_NFLOG`, so its transactional `iptables-restore` discards the *entire* ruleset. Policies are accepted and never enforced, ingress **and** egress |
 | NodePort / `type: LoadBalancer` | no inbound TCP reaches the container except through the Worker; svcproxy serves the ClusterIP only |
 | Source IP preservation | svcproxy re-originates connections, so backends see the node address |
 | `sessionAffinity: ClientIP` | not implemented by svcproxy (ignored with a warning) |
+| Service ports 8001 / 8080 | the host binds these on `0.0.0.0` (kubectl proxy, status server), so svcproxy cannot bind a ClusterIP on them. Pick another port |
+| `kubectl get --raw <path>` | `--raw` keeps only the *host* from the kubeconfig server URL and drops the `/k8s` prefix, so it hits the Worker dashboard and returns HTTP 200 HTML. Use `--raw /k8s/<path>` |
 | flannel vxlan | `failed to create vxlan device: operation not supported`, hence host-gw |
 | Multi-node | no vxlan device and no inbound UDP, so no cross-node overlay |
+
+**NetworkPolicy deserves emphasis, because it fails in the most dangerous way
+available: silently.** The objects are accepted, `kubectl get networkpolicy`
+shows them, k3s ships a controller — and nothing is enforced, including
+`deny-all` egress to the internet. Do not rely on it for isolation here. That
+makes `xt_NFLOG` a seventh missing kernel feature, in the same family as
+kube-proxy's `xt_nfacct`.
 
 kube-proxy is the crux, and every one of its backends loses to this kernel:
 
@@ -149,9 +166,11 @@ There's also a [Cloudflare Tunnel path](docs/TUNNEL.md) that carries native TLS 
 It's a free country. I'm not going to pretend to know what you're building; if you want to run this in prod, be my guest, and if something bad happens, not my fault. What I will do is tell you exactly what you're getting:
 
 - The `/k8s` passthrough collapses cluster-admin into a single bearer token. Whoever holds it owns the cluster. No users, no RBAC mapping, no audit trail beyond the apiserver's own.
+- That token is not the only way in, and this is worth understanding before you run anything untrusted here. `kubectl proxy` holds the node's admin kubeconfig and authenticates nobody; the Worker is the only gate in front of it. Because svcproxy routes the whole service CIDR host-local, a pod could reach it at the node IP *or at any `10.43.x.x`* and get cluster-admin with no token and no ServiceAccount — RBAC bypassed completely. The entrypoint now drops pod traffic to `:8001` and `:8080`, which closes it, but the underlying listeners are still unauthenticated: treat every pod on this cluster as a trust boundary you have not really established.
 - Everything except `/healthz` requires that token, and the dashboard redacts known secrets from command output. That is the entire security model.
 - Cluster state survives restarts only if you enable the R2 replication above, and PersistentVolume data only if you also use the `juicefs-r2` class. A `local-path` volume dies with the disk.
 - Services work through a userspace proxy, not the kernel. Backends never see real client IPs, which breaks NetworkPolicy-by-source and any app-level IP allowlist. Throughput is a userspace copy per connection.
+- NetworkPolicy will not save you: it is accepted and silently unenforced (above). There is no working in-cluster network isolation.
 - One node, and it can go away at any time. There is no HA story here at all.
 
 MIT licensed, no warranty, see [LICENSE](LICENSE).
@@ -341,6 +360,31 @@ along with the rest of the cluster.
   that, a PVC would provision onto the ephemeral disk under a name that promises
   R2. Bound PVCs are unaffected; new ones fail loudly, which is the point.
 
+## Image cache on R2
+
+Every cold wake starts with an empty containerd store, so image pulls dominate the
+restore path. `kubeflare-registry` is a separate Worker
+([cloudflare/serverless-registry](https://github.com/cloudflare/serverless-registry))
+backed by R2 that acts as a pull-through mirror: containerd asks it for `docker.io`
+images, it fetches on a miss, caches into R2, and serves from R2 thereafter.
+
+It runs as its own Worker rather than inside the container deliberately — it stays up
+while the cluster is asleep, which is exactly when a cold wake needs it, and it costs
+the cluster no CPU or memory.
+
+One non-obvious thing, learned the hard way: **the upstream is `mirror.gcr.io`, not
+Docker Hub.** Pointing it at `registry-1.docker.io` anonymously fails, because a
+Worker's egress is shared Cloudflare infrastructure and Docker Hub's per-IP anonymous
+limit is permanently exhausted there — the token exchange succeeds and then the
+manifest request comes back `429`. `mirror.gcr.io` is Google's public Docker Hub
+pull-through and has no such per-IP cliff. Docker Hub stays configured as a second
+choice; add your own Docker Hub credentials to it if you want the authenticated
+100/hour account limit instead.
+
+Set `REGISTRY_MIRROR_URL` to `""` in `wrangler.jsonc` to pull straight from Docker Hub.
+containerd always appends the real upstream after any mirror, so a broken cache makes
+pulls slow rather than impossible.
+
 ## Roadmap
 
 Roughly in order of value:
@@ -350,6 +394,11 @@ Roughly in order of value:
 - [x] Litestream replication of the kine SQLite database to R2 (opt-in, needs an R2 token).
 - [x] Persist the cluster CA across restarts — the CA rides inside the replicated datastore; token + node password pinned by deploy.sh.
 - [x] ClusterIP without kube-proxy — `svcproxy/`, a userspace Service proxy on AnyIP-bound ClusterIPs.
+- [x] R2-backed PersistentVolumes — JuiceFS host mount + a `juicefs-r2` StorageClass, RWX, verified surviving a disk wipe.
+- [x] R2-backed image cache — a separate `kubeflare-registry` Worker (cloudflare/serverless-registry) mirroring docker.io.
+- [x] metrics-server, and therefore `kubectl top` and HPA — it only ever needed working ClusterIPs.
+- [x] An empirical API conformance matrix and suite — [docs/CONFORMANCE.md](docs/CONFORMANCE.md), `conformance/run.sh`.
+- [ ] Bind `kubectl proxy` and the status server to the node IP instead of `0.0.0.0`, so the pod→host firewall guards become belt-and-braces rather than the only defence — and so Services can use ports 8001/8080.
 - [ ] Source-IP preservation and `sessionAffinity: ClientIP` in svcproxy; NodePort via the Worker.
 - [x] R2-backed PersistentVolumes: JuiceFS (host mount, SQLite metadata on the same litestream pipeline) + a `juicefs-r2` StorageClass.
 - [ ] R2-backed image cache: `registry:3` pull-through proxy on the s3 driver, `registries.yaml` mirror — cold boots stop re-pulling from Docker Hub.
@@ -372,6 +421,8 @@ Contributions welcome. The point of the exercise is to find out how much of the 
 | `scripts/deploy.sh` | One command from zero to a working `kubeconfig.yaml` |
 | `scripts/tunnel-setup.sh` | Automates the Cloudflare Tunnel path end to end (needs an API token) |
 | `docs/FINDINGS.md` | The full write-up: probe matrix, every error, exact causes |
+| `docs/CONFORMANCE.md` | Empirical API matrix: 153 work, 14 broken, measured not inferred |
+| `conformance/` | The suite behind that matrix — `conformance/run.sh` |
 
 ## License
 

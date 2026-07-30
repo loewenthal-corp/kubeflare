@@ -37,6 +37,7 @@ def redact(text: str) -> str:
         "LITESTREAM_ACCESS_KEY_ID",
         "LITESTREAM_SECRET_ACCESS_KEY",
         "R2_ENDPOINT",
+        "REGISTRY_MIRROR_PASSWORD",
     ):
         val = os.environ.get(var)
         if val and len(val) > 6:

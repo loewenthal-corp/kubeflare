@@ -26,6 +26,11 @@ export class KubeFlare extends Container<Env> {
     R2_BUCKET: this.env.R2_BUCKET ?? "",
     K3S_TOKEN: this.env.K3S_TOKEN ?? "",
     K3S_NODE_PASSWORD: this.env.K3S_NODE_PASSWORD ?? "",
+    // R2-backed pull-through image cache (the separate kubeflare-registry
+    // Worker). Optional: without it containerd pulls straight from Docker Hub.
+    REGISTRY_MIRROR_URL: this.env.REGISTRY_MIRROR_URL ?? "",
+    REGISTRY_MIRROR_USERNAME: this.env.REGISTRY_MIRROR_USERNAME ?? "",
+    REGISTRY_MIRROR_PASSWORD: this.env.REGISTRY_MIRROR_PASSWORD ?? "",
     // R2-backed PersistentVolumes (JuiceFS → the juicefs-r2 StorageClass). Rides
     // on the credentials and endpoint above; this is just the data bucket, so it
     // is a plain var. Blank turns the feature off, and it is off anyway unless
@@ -59,6 +64,9 @@ interface Env {
   R2_BUCKET_JFS?: string;
   K3S_TOKEN?: string;
   K3S_NODE_PASSWORD?: string;
+  REGISTRY_MIRROR_URL?: string;
+  REGISTRY_MIRROR_USERNAME?: string;
+  REGISTRY_MIRROR_PASSWORD?: string;
 }
 
 const INSTANCE = "main";

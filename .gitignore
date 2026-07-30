@@ -19,3 +19,6 @@ tunnel-kubeconfig.yaml
 
 # stray go build output
 svcproxy/svcproxy
+
+# image-cache registry credentials
+.kubeflare-registry-creds

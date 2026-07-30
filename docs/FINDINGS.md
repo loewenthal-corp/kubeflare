@@ -20,7 +20,15 @@ favour, and one of its "concede it" items (pod networking) actually works.
 | Phase 1 | Control plane + simulated (kwok) nodes | **Surpassed** — no simulation needed |
 | Phase 2 | Rootless k3s, one real node, hostNetwork pod | **Surpassed** — *non*-rootless k3s, real node, real CNI pod IPs |
 | Phase 2+ | — | 3 × nginx `Running`, `kubectl` from laptop, `kubectl logs`, pod→pod networking |
-| Not achieved | — | ClusterIP Services, cluster DNS, `kubectl exec` *through the Worker* |
+| Not achieved | — | ~~ClusterIP Services, cluster DNS, `kubectl exec` *through the Worker*~~ — **all three now work, see §5.x** |
+
+> **This section is the original spike write-up and is kept for the record.** Three of
+> its "not achieved" items fell later the same week: ClusterIP Services (userspace
+> `svcproxy/`), cluster DNS (hostNetwork coredns), and `kubectl exec`/`attach`/
+> `port-forward` (the blocker was the Worker, not the edge). §5.x records how, and
+> [CONFORMANCE.md](CONFORMANCE.md) supersedes this document as the statement of what
+> works — it is measured against the live cluster across 175 checks, where this was a
+> point-in-time spike. Read §5.x before trusting anything above it.
 
 ---
 
@@ -279,6 +287,27 @@ Findings from a follow-up session; the sections above are kept as written for th
   returns 200, and 6 requests across a 3-replica Service land 2/2/2. Every one of
   those timed out before. Costs: source IP is the node's (userspace re-origination),
   no `sessionAffinity: ClientIP`, no NodePort.
+
+- **A seventh kernel gap, found by the conformance sweep: `xt_NFLOG`.** NetworkPolicy
+  is accepted and silently unenforced — ingress and egress, ClusterIP and direct pod
+  IP, including `deny-all` egress to the internet. k3s's kube-router controller emits
+  `-j NFLOG` in each per-pod chain; the node log says
+  `Aborting sync… Extension NFLOG revision 0 not supported`, and because its
+  `iptables-restore` is transactional, the whole policy ruleset is discarded. Exactly
+  the failure mode as kube-proxy's `xt_nfacct`, and more dangerous because nothing
+  surfaces an error to the user.
+
+- **The AnyIP route turned the service CIDR into a wildcard alias for node-local
+  ports, which was a privilege escalation.** Any address in `10.43.0.0/16` reaches
+  anything bound `0.0.0.0` on the host — so `kubectl proxy` (:8001), which holds the
+  admin kubeconfig and authenticates nobody, was reachable from every pod at the node
+  IP *and* at any ClusterIP. Confirmed by reading every `kube-system` Secret and
+  minting ServiceAccount tokens from an unprivileged busybox pod. The entrypoint now
+  drops pod→host traffic to :8001 and :8080 (`-i cni0`, so it cannot be spoofed);
+  verified blocked afterwards while DNS and ClusterIP traffic keep working. The
+  listeners are still unauthenticated, so the proper fix is to bind them to the node
+  IP only — as coredns already does, which is why the kube-dns ClusterIP on :53 does
+  not collide. Side effect worth knowing: Services cannot use ports 8001 or 8080.
 
   Full probe results (deployed kernel, `iptables -A` per extension):
   `xt_conntrack`, `xt_addrtype`, `xt_mark`, `MARK`, `MASQUERADE`

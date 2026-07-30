@@ -80,6 +80,7 @@ container hostnames are not stable across instances.
 - **`kubectl exec`, `attach`, `port-forward`, `cp`** — over the WebSocket transport that has been kubectl's default since 1.31, straight through the Worker. No tunnel required.
 - **`kubectl top` and HorizontalPodAutoscalers**, via a vendored metrics-server. It was only ever disabled because the aggregation layer needs a working ClusterIP.
 - **Admission webhooks**, including your own — the apiserver reaches a webhook's ClusterIP through svcproxy. This is what makes operators and Crossplane installable.
+- **NodePort Services**, including from the internet — see below.
 - Most of the API surface, measured rather than assumed: 153 features work across 175 checks. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 - `kubectl` from anywhere: get, create, apply, scale, delete, logs, describe, rollout.
 - Self-healing. A supervisor restarts k3s if it dies, and after a disk wipe the cluster rebuilds itself unattended — or restores itself from R2 if durable state is on.
@@ -92,7 +93,7 @@ Every entry below is a kernel gap, and the kernel takes no modules: there is no 
 |---|---|
 | kube-proxy, all four backends | this kernel is missing something for each one (below) — worked around in userspace, see `svcproxy/` |
 | **NetworkPolicy — silently does nothing** | kube-router emits `-j NFLOG` per pod chain and the kernel has no `xt_NFLOG`, so its transactional `iptables-restore` discards the *entire* ruleset. Policies are accepted and never enforced, ingress **and** egress |
-| NodePort / `type: LoadBalancer` | no inbound TCP reaches the container except through the Worker; svcproxy serves the ClusterIP only |
+| `type: LoadBalancer` status | no cloud LB controller, so `.status.loadBalancer.ingress` stays empty. The allocated nodePort still works (below) |
 | Source IP preservation | svcproxy re-originates connections, so backends see the node address |
 | `sessionAffinity: ClientIP` | not implemented by svcproxy (ignored with a warning) |
 | Service ports 8001 / 8080 | the host binds these on `0.0.0.0` (kubectl proxy, status server), so svcproxy cannot bind a ClusterIP on them. Pick another port |
@@ -360,6 +361,37 @@ along with the rest of the cluster.
   that, a PVC would provision onto the ephemeral disk under a name that promises
   R2. Bound PVCs are unaffected; new ones fail loudly, which is the point.
 
+## NodePort, including from the internet
+
+NodePort has two halves here, and both work now.
+
+Inside the cluster, svcproxy binds each Service's allocated node port on the
+wildcard address, so `<nodeIP>:<nodePort>` behaves the way it does on any
+cluster. The wildcard bind is deliberate: it is what NodePort means, and the
+container's externally-facing address is not contractual, so guessing a specific
+one would make the port unreachable from outside.
+
+Getting to it from the internet is the half the platform seems to forbid — no
+inbound TCP reaches a Container. The Worker is the inbound path:
+
+```bash
+kubectl expose deployment nginx --name=np-demo --type=NodePort --port=80
+NP=$(kubectl get svc np-demo -o jsonpath='{.spec.ports[0].nodePort}')
+curl -H "Authorization: Bearer $(cat .kubeflare-token)" \
+  "https://kubeflare.<your-subdomain>.workers.dev/np/$NP/"
+```
+
+That returns the pod's response. `type: LoadBalancer` Services also get a
+nodePort, so they are reachable the same way — only `.status.loadBalancer.ingress`
+stays empty, since nothing is acting as a cloud LB controller.
+
+Two limits worth knowing. The route strips the `/np/<port>` prefix so the backend
+sees the path it expects, which means building a new `Request` — and that is
+precisely what drops connection-upgrade semantics, so this path carries ordinary
+HTTP but not WebSockets. And it is restricted to ports 30000-32767: without that
+guard it would be a general "reach any port in the container" primitive, which
+would include the unauthenticated admin proxy on 8001.
+
 ## Image cache on R2
 
 Every cold wake starts with an empty containerd store, so image pulls dominate the
@@ -399,7 +431,9 @@ Roughly in order of value:
 - [x] metrics-server, and therefore `kubectl top` and HPA — it only ever needed working ClusterIPs.
 - [x] An empirical API conformance matrix and suite — [docs/CONFORMANCE.md](docs/CONFORMANCE.md), `conformance/run.sh`.
 - [ ] Bind `kubectl proxy` and the status server to the node IP instead of `0.0.0.0`, so the pod→host firewall guards become belt-and-braces rather than the only defence — and so Services can use ports 8001/8080.
-- [ ] Source-IP preservation and `sessionAffinity: ClientIP` in svcproxy; NodePort via the Worker.
+- [x] NodePort Services, reachable from the internet through the Worker.
+- [ ] Source-IP preservation and `sessionAffinity: ClientIP` in svcproxy.
+- [ ] `type: LoadBalancer` status: a controller that provisions a Cloudflare Tunnel public hostname per Service and writes it into `.status.loadBalancer.ingress`.
 - [x] R2-backed PersistentVolumes: JuiceFS (host mount, SQLite metadata on the same litestream pipeline) + a `juicefs-r2` StorageClass.
 - [ ] R2-backed image cache: `registry:3` pull-through proxy on the s3 driver, `registries.yaml` mirror — cold boots stop re-pulling from Docker Hub.
 - [ ] WARP private networking: route `10.42.0.0/15` through the tunnel so an enrolled laptop reaches pod/service IPs directly.

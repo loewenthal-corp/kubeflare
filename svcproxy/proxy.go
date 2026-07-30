@@ -25,8 +25,16 @@ type proxyKey struct {
 	proto string // "TCP" or "UDP"
 }
 
-func (k proxyKey) addr() string   { return net.JoinHostPort(k.ip, strconv.Itoa(int(k.port))) }
-func (k proxyKey) String() string { return k.addr() + "/" + k.proto }
+// addr is what gets passed to Listen. An empty ip yields ":30080", which Go
+// binds on every address — that is how NodePort listeners are expressed.
+func (k proxyKey) addr() string { return net.JoinHostPort(k.ip, strconv.Itoa(int(k.port))) }
+
+func (k proxyKey) String() string {
+	if k.ip == "" {
+		return "*:" + strconv.Itoa(int(k.port)) + "/" + k.proto + " (nodePort)"
+	}
+	return k.addr() + "/" + k.proto
+}
 
 // endpointPool is an atomically swappable snapshot of ready backends, handed
 // out round-robin. Accept loops read it lock-free; the controller swaps it on

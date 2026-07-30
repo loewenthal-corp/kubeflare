@@ -110,6 +110,45 @@ export default {
       return new Response("forbidden\n", { status: 403 });
     }
 
+    // Expose a NodePort Service to the internet: /np/<nodePort>/<path...>
+    //
+    // NodePort is otherwise only half-implemented here. svcproxy binds the
+    // allocated node port inside the container, which makes it correct for
+    // in-cluster and host-local callers, but the platform accepts no inbound
+    // TCP — so without this route nothing outside can ever reach it. Here the
+    // Worker is the missing inbound path.
+    //
+    // The prefix is stripped, so the backend sees the path it expects. That
+    // means building a new Request, which is exactly what drops connection
+    // upgrade semantics — so this carries ordinary HTTP, not WebSockets. The
+    // /k8s route deliberately avoids the rewrite for that reason.
+    const np = url.pathname.match(/^\/np\/(\d+)(\/.*)?$/);
+    if (np) {
+      const port = Number(np[1]);
+      // Only the NodePort range. Without this the route would be a generic
+      // "reach any port in the container" primitive, which includes the
+      // unauthenticated admin proxy on 8001.
+      if (port < 30000 || port > 32767) {
+        return new Response(
+          `port ${port} is outside the NodePort range 30000-32767\n`,
+          { status: 400, headers: { "content-type": "text/plain" } },
+        );
+      }
+      const target = new URL(request.url);
+      target.pathname = np[2] ?? "/";
+      try {
+        return await container.fetch(
+          switchPort(new Request(target, request), port),
+        );
+      } catch (err) {
+        console.log("nodeport passthrough error:", String(err));
+        return new Response(
+          `kubeflare: nothing is serving nodePort ${port}\n\n${String(err)}\n`,
+          { status: 502, headers: { "content-type": "text/plain" } },
+        );
+      }
+    }
+
     // Restart the container instance. Needed because envVars are read once, at
     // container start: changing a Worker secret (R2 credentials, tunnel token)
     // does NOT reach a running container, and a secret-only change does not

@@ -239,6 +239,20 @@ func (c *controller) desiredState() map[proxyKey]listenerSpec {
 				desired[proxyKey{ip: ip, port: port.Port, proto: string(proto)}] =
 					listenerSpec{service: name, endpoints: endpoints}
 			}
+
+			// NodePort. Bound on the wildcard address rather than a specific one,
+			// which is both what upstream NodePort means ("every node address")
+			// and what makes it reachable from the Worker — the container's
+			// externally-facing address is not contractual, so guessing one
+			// wrong would make the port unreachable from outside.
+			//
+			// Node ports live in 30000-32767 and so cannot collide with the
+			// host's own 0.0.0.0 listeners on 8001/8080 (see entrypoint.sh).
+			if port.NodePort != 0 &&
+				(svc.Spec.Type == corev1.ServiceTypeNodePort || svc.Spec.Type == corev1.ServiceTypeLoadBalancer) {
+				desired[proxyKey{ip: "", port: port.NodePort, proto: string(proto)}] =
+					listenerSpec{service: name, endpoints: endpoints}
+			}
 		}
 	}
 	// Forget warn suppressions for conditions that no longer hold, so they

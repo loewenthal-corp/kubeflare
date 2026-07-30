@@ -24,7 +24,13 @@
     // R2 bucket for durable cluster state (litestream). The bucket name is not
     // sensitive; the endpoint (it embeds your account id) and credentials are
     // Worker secrets — deploy.sh prints instructions.
-    "R2_BUCKET": "kubeflare-state"
+    "R2_BUCKET": "kubeflare-state",
+    // R2 bucket holding the file data behind the juicefs-r2 StorageClass. Must
+    // exist and must be covered by the same R2 token as R2_BUCKET. Set it to ""
+    // to leave R2-backed PersistentVolumes off; it is off regardless unless
+    // durable state is enabled. Do not point it at R2_BUCKET — JuiceFS refuses
+    // to initialise a volume whose bucket already has objects in it.
+    "R2_BUCKET_JFS": "kubeflare-jfs"
   },
 
   "containers": [

@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl iproute2 iptables python3 jq procps \
       mount util-linux ethtool socat conntrack kmod \
       nftables ipset \
+      fuse3 \
     && rm -rf /var/lib/apt/lists/*
 
 # k3s ships its own kubectl (`k3s kubectl`), so we do not install one separately.
@@ -64,11 +65,37 @@ RUN set -eux; \
     rm /tmp/litestream.tar.gz; \
     /usr/local/bin/litestream version
 
+# JuiceFS backs the optional juicefs-r2 StorageClass: a POSIX filesystem whose
+# data lives in R2 and whose metadata is a local SQLite DB on the same litestream
+# pipeline as kine's. Pinned, not "latest": the release asset URL has no /latest
+# alias and 1.4.x is the current stable line.
+#
+# fuse3 above is belt and braces. JuiceFS sets go-fuse's DirectMount, so as root
+# it mounts with mount(2) on /dev/fuse and needs no suid helper; fusermount3 is
+# only the fallback path (and makes a manual `fusermount3 -u` possible).
+ARG JUICEFS_VERSION=1.4.0
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) jfs_arch=amd64 ;; \
+      arm64) jfs_arch=arm64 ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/juicefs.tar.gz \
+      "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-${jfs_arch}.tar.gz"; \
+    tar -C /usr/local/bin -xzf /tmp/juicefs.tar.gz juicefs; \
+    rm /tmp/juicefs.tar.gz; \
+    /usr/local/bin/juicefs version
+
 COPY --from=svcproxy-build /out/kubeflare-svcproxy /usr/local/bin/kubeflare-svcproxy
 COPY container/entrypoint.sh /entrypoint.sh
 COPY container/status-server.py /status-server.py
 COPY container/litestream.yml /etc/litestream.yml
 COPY container/manifests/ /manifests/
+# Applied only when the entrypoint has a live JuiceFS mount — a StorageClass
+# whose backing filesystem is missing would provision PVs onto the ephemeral
+# disk while claiming to be durable, so it must not exist unless the mount does.
+COPY container/manifests-optional/ /manifests-optional/
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 8080

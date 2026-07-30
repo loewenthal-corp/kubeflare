@@ -9,9 +9,11 @@
 # patching it live instead would be undone by k3s's addon reconciler on every
 # restart.
 #
-# Volumes land under /var/lib/rancher/k3s/storage on the EPHEMERAL disk: they
-# survive pod restarts, not container restarts. Real durability comes from the
-# R2-backed storage work (see roadmap).
+# The default local-path class puts volumes under /var/lib/rancher/k3s/storage on
+# the EPHEMERAL disk: they survive pod restarts, not container restarts. For
+# volumes that outlive the disk there is a second class, juicefs-r2, backed by
+# the JuiceFS-on-R2 mount — see manifests-optional/juicefs-storage.yaml, which
+# entrypoint.sh applies only when that mount is actually up.
 # __NODE_IP__ is substituted by entrypoint.sh at boot.
 apiVersion: v1
 kind: ServiceAccount
@@ -56,14 +58,36 @@ metadata:
   name: local-path-config
   namespace: kube-system
 data:
+  # Two classes from one provisioner, via v0.0.36's per-class config:
+  # storageClassConfigs maps a StorageClass name to either a nodePathMap (paths
+  # on a node's own disk, RWO only) or a sharedFileSystemPath (one filesystem
+  # reachable from every node, which unlocks ROX and RWX). The provisioner's
+  # README: "Please note that nodePathMap, sharedFileSystemPath, and
+  # storageClassConfigs are mutually exclusive. If sharedFileSystemPath or
+  # storageClassConfigs are used, then nodePathMap must be set to []."
+  #
+  # The juicefs-r2 entry is inert unless entrypoint.sh applies
+  # manifests-optional/juicefs-storage.yaml, because a class that does not exist
+  # can never be provisioned for. But note the consequence of switching to
+  # storageClassConfigs at all: pickConfig() rejects any class name absent from
+  # this map ("BUG: Got request for unexpected storage class"), so a hand-rolled
+  # StorageClass using provisioner rancher.io/local-path now needs an entry here.
   config.json: |-
     {
-      "nodePathMap":[
-      {
-        "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
-        "paths":["/var/lib/rancher/k3s/storage"]
+      "nodePathMap":[],
+      "storageClassConfigs":{
+        "local-path":{
+          "nodePathMap":[
+          {
+            "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
+            "paths":["/var/lib/rancher/k3s/storage"]
+          }
+          ]
+        },
+        "juicefs-r2":{
+          "sharedFileSystemPath":"/mnt/juicefs/pvcs"
+        }
       }
-      ]
     }
   helperPod.yaml: |-
     apiVersion: v1

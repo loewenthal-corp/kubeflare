@@ -1,0 +1,39 @@
+# R2-backed PersistentVolumes.
+#
+# NOT applied automatically. /manifests is applied on every boot; this directory
+# is applied by entrypoint.sh only once it has a live JuiceFS mount at
+# /mnt/juicefs. That gate is the whole design: local-path's helper pod hostPaths
+# the volume's parent directory with DirectoryOrCreate, so provisioning against a
+# missing mount would create the path on the ephemeral disk underneath and hand
+# out a volume that looks durable and isn't.
+#
+# The provisioner and its config live in manifests/local-path-storage.yaml — the
+# storageClassConfigs entry for this class points at /mnt/juicefs/pvcs as a
+# sharedFileSystemPath, which is what makes ReadWriteMany legal here (a nodePath
+# class is restricted to ReadWriteOnce/ReadWriteOncePod).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: juicefs-r2
+  annotations:
+    # Deliberately not the default class. Every fsync on this filesystem costs an
+    # R2 round trip, so it should be an explicit choice, not what you get by
+    # forgetting to name a class.
+    storageclass.kubernetes.io/is-default-class: "false"
+    # No defaultVolumeType here on purpose. local-path defaults to hostPath, which
+    # is the only correct choice for a shared filesystem: a `local` PV source is
+    # rejected by the apiserver unless it carries node affinity, and the
+    # provisioner deliberately emits none for a sharedFileSystemPath class.
+provisioner: rancher.io/local-path
+# Delete really deletes: the volume is formatted with --trash-days 0, so the R2
+# objects go immediately and are not recoverable. Use Retain on anything you care
+# about more than you care about tidiness.
+reclaimPolicy: Delete
+# Immediate, unlike local-path: the filesystem is not node-local, so there is
+# nothing to learn by waiting for a consumer to be scheduled. The provisioner
+# skips node affinity entirely for a sharedFileSystemPath class.
+volumeBindingMode: Immediate
+# There is no quota enforcement. A PVC's requested size is recorded on the PV and
+# ignored by the filesystem; the real limit is R2, which is effectively unbounded
+# and billed by the gigabyte-month.
+allowVolumeExpansion: false

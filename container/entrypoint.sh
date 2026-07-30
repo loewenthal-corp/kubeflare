@@ -99,6 +99,185 @@ if [ -n "$LITESTREAM_ENABLED" ]; then
   log "litestream: restore step complete (node=$NODE_NAME)"
 fi
 
+# ---------------------------------------------------------------- juicefs (R2 PVs)
+# JuiceFS gives PersistentVolumes real durability: a POSIX filesystem mounted on
+# the host at $JFS_MOUNT whose file data is objects in R2 and whose inode tree is
+# a local SQLite DB. local-path-provisioner hands out subdirectories of it through
+# the juicefs-r2 StorageClass (manifests-optional/juicefs-storage.yaml).
+#
+# Strictly an extension of the litestream feature, and not only by convention:
+# the metadata DB is the filesystem. Losing it on the ephemeral disk would leave
+# the R2 objects unreadable AND leave the bucket non-empty, which is exactly the
+# state `juicefs format` refuses to touch. So no litestream, no JuiceFS.
+#
+# Everything below is best-effort. k3s must come up whether or not any of it
+# works, so every failure path here ends in "log it and leave JUICEFS_MOUNTED
+# empty", never in exit.
+JFS_MOUNT=/mnt/juicefs
+JFS_PV_DIR="$JFS_MOUNT/pvcs"
+JFS_META_DB=/var/lib/kubeflare/jfs-meta.db
+JFS_CACHE=/var/lib/kubeflare/jfs-cache
+JFS_NAME=kubeflare
+JFS_SUP_PID=""
+JUICEFS_MOUNTED=""
+
+JUICEFS_ENABLED=""
+if [ -n "${R2_BUCKET_JFS:-}" ]; then
+  if [ -n "$LITESTREAM_ENABLED" ]; then
+    JUICEFS_ENABLED=yes
+  else
+    log "juicefs: R2_BUCKET_JFS set but durable state is off; skipping (metadata would not survive the disk)"
+  fi
+else
+  log "juicefs: no R2_BUCKET_JFS, skipping R2-backed volumes"
+fi
+
+if [ -n "$JUICEFS_ENABLED" ]; then
+  mkdir -p "$(dirname "$JFS_META_DB")" "$JFS_CACHE" "$JFS_MOUNT"
+
+  # Ordering: restore the metadata BEFORE deciding whether to format. A
+  # successful restore that produces no file is litestream's way of saying the
+  # replica is genuinely empty (-if-replica-exists only swallows
+  # ErrTxNotAvailable; a 403 on the bucket is a non-zero exit), so file-exists
+  # afterwards is a trustworthy "this volume already exists" signal.
+  #
+  # Unlike the k3s DB, a failed restore here is not fatal — but it MUST NOT fall
+  # through to format either: formatting on top of a replica we merely failed to
+  # read would mint a second filesystem over the first one's objects.
+  jfs_restored=""
+  for attempt in 1 2 3; do
+    if litestream restore -config /etc/litestream.yml \
+         -if-db-not-exists -if-replica-exists "$JFS_META_DB" \
+         >>"$LOG_DIR/litestream.log" 2>&1; then
+      jfs_restored=yes; break
+    fi
+    log "juicefs: metadata restore attempt $attempt failed; retrying (see litestream.log)"
+    sleep $((attempt * 2))
+  done
+  if [ -z "$jfs_restored" ]; then
+    log "juicefs: metadata restore failed; NOT formatting over an unread replica — R2 volumes stay off"
+    JUICEFS_ENABLED=""
+  fi
+fi
+
+if [ -n "$JUICEFS_ENABLED" ]; then
+  # ACCESS_KEY/SECRET_KEY are juicefs's own env var names; only `format` and
+  # `config` read them, because format stores the keys inside the metadata and
+  # `mount` uses those. Set per command rather than exported so they stay out of
+  # k3s's environment — and as a shell assignment prefix rather than via env(1),
+  # which would put them in argv where the dashboard's process list can see them.
+  #
+  # AWS_REGION: the s3 driver derives no region from a non-AWS endpoint and would
+  # otherwise sign with us-east-1. R2 wants "auto", same as litestream's config.
+  if [ ! -f "$JFS_META_DB" ]; then
+    # First boot only. format checks the bucket is empty and does a
+    # write/read/delete probe, so a token that does not cover this bucket fails
+    # here with a logged 403 rather than hanging or silently writing nowhere.
+    #
+    # --trash-days 0: `juicefs gc` cannot run against R2 (its object listing is
+    # not lexicographically ordered), so there must be no second class of data
+    # that is invisible in the filesystem yet still billed. Deleting a PVC frees
+    # the R2 objects immediately and irreversibly; the StorageClass reclaimPolicy
+    # is the only safety net.
+    #
+    # --no-update is redundant given the file-exists guard and kept anyway: it
+    # makes format a no-op on an already-formatted volume, so a wrong guess about
+    # the guard cannot silently rewrite a live volume's settings.
+    log "juicefs: formatting volume $JFS_NAME on $R2_BUCKET_JFS (first boot)"
+    if ACCESS_KEY="$LITESTREAM_ACCESS_KEY_ID" \
+       SECRET_KEY="$LITESTREAM_SECRET_ACCESS_KEY" \
+       AWS_REGION=auto \
+       juicefs format \
+         --storage s3 \
+         --bucket "${R2_ENDPOINT}/${R2_BUCKET_JFS}" \
+         --trash-days 0 \
+         --no-update \
+         "sqlite3://${JFS_META_DB}" "$JFS_NAME" \
+         >>"$LOG_DIR/juicefs.log" 2>&1; then
+      log "juicefs: format ok"
+    else
+      log "juicefs: format FAILED (see juicefs.log); R2 volumes stay off"
+      JUICEFS_ENABLED=""
+    fi
+  else
+    # format stores the object-store credentials inside the metadata DB, so a
+    # restored volume still carries whatever key it was created with. Push the
+    # current ones in, or a rotated R2 token would 403 on every upload for ever
+    # while litestream (which reads its keys from the environment) kept working.
+    # Best-effort: if this fails the stored keys are probably still valid.
+    AWS_REGION=auto juicefs config --yes \
+      --access-key "$LITESTREAM_ACCESS_KEY_ID" \
+      --secret-key "$LITESTREAM_SECRET_ACCESS_KEY" \
+      "sqlite3://${JFS_META_DB}" >>"$LOG_DIR/juicefs.log" 2>&1 \
+      || log "juicefs: could not refresh stored credentials (see juicefs.log)"
+  fi
+fi
+
+# Supervised like svcproxy: the subshell restarts the client if it dies.
+start_juicefs() {
+  (
+    while true; do
+      # A client that died leaves its FUSE mount attached with every operation
+      # returning ENOTCONN, and mounting over that fails. Detach lazily first —
+      # lazily because pods may still hold open fds on the dead mount.
+      umount -l "$JFS_MOUNT" 2>/dev/null
+      # --backup-meta 0 is mandatory on R2: the automatic metadata dump rotates
+      # old copies via ListObjects, and R2 returns keys in no particular order,
+      # so the rotation misbehaves. litestream (litestream.yml) is the metadata
+      # backup instead. The same listing quirk is why juicefs gc/fsck/sync/
+      # destroy do not work against this volume at all.
+      #
+      # No --writeback. It acknowledges writes as soon as they hit the local
+      # cache dir, which is on the disk that gets wiped on every sleep, rollout
+      # and eviction — precisely the data we are trying not to lose. Without it a
+      # successful fsync means the blocks are in R2, at the cost of R2 PUT
+      # latency per fsync.
+      #
+      # --cache-size is in MiB and defaults to 100 GiB, which is nonsense on a
+      # 16 GB disk already shared with containerd images and kine. 3 GiB plus a
+      # 20% free-space floor leaves room for both. Cache loss is harmless: it is
+      # a read cache only, refilled from R2.
+      #
+      # allow_other is not passed: juicefs sets it automatically when it runs as
+      # root, and it is what lets non-root containers read their own volumes.
+      AWS_REGION=auto juicefs mount "sqlite3://${JFS_META_DB}" "$JFS_MOUNT" \
+        --backup-meta 0 \
+        --cache-dir "$JFS_CACHE" \
+        --cache-size 3072 \
+        --free-space-ratio 0.2 \
+        --no-usage-report \
+        >>"$LOG_DIR/juicefs.log" 2>&1
+      log "juicefs mount exited (see juicefs.log); restarting in 10s"
+      sleep 10
+    done
+  ) &
+  JFS_SUP_PID=$!
+  log "juicefs supervisor pid=$JFS_SUP_PID"
+}
+
+if [ -n "$JUICEFS_ENABLED" ]; then
+  start_juicefs
+  # Wait for the mount before k3s starts. kubelet resolves hostPath directories
+  # at pod-start time, so a mount that arrives late would not be an error — but
+  # the PV parent directory below has to be created ON the filesystem, not on the
+  # ephemeral disk underneath it, and that is only safe once it is mounted.
+  # Read /proc/self/mounts rather than shelling out: this is PID 1, so it is the
+  # host mount table.
+  for _ in $(seq 1 60); do
+    # The line looks like: JuiceFS:kubeflare /mnt/juicefs fuse.juicefs rw,...
+    if grep -qF " $JFS_MOUNT fuse" /proc/self/mounts; then
+      JUICEFS_MOUNTED=yes; break
+    fi
+    sleep 1
+  done
+  if [ -n "$JUICEFS_MOUNTED" ]; then
+    mkdir -p "$JFS_PV_DIR"
+    log "juicefs: mounted at $JFS_MOUNT, PV root $JFS_PV_DIR"
+  else
+    log "juicefs: mount did not appear within 60s (see juicefs.log); R2 volumes stay off"
+  fi
+fi
+
 SAN_ARGS=(--tls-san 127.0.0.1 --tls-san localhost)
 [ -n "$TUNNEL_HOSTNAME" ] && SAN_ARGS+=(--tls-san "$TUNNEL_HOSTNAME")
 
@@ -141,7 +320,7 @@ NET_ARGS+=(--kubelet-arg=cluster-dns="$NODE_IP")
 
 # ---------------------------------------------------------------- k3s
 start_k3s() {
-  log "starting k3s server (node=$NODE_NAME, flannel=$FLANNEL_BACKEND, litestream=${LITESTREAM_ENABLED:-no})"
+  log "starting k3s server (node=$NODE_NAME, flannel=$FLANNEL_BACKEND, litestream=${LITESTREAM_ENABLED:-no}, juicefs=${JUICEFS_MOUNTED:-no})"
   # coredns and local-storage are disabled in favour of the vendored copies in
   # /manifests: the packaged ones talk to the apiserver via the
   # kubernetes.default ClusterIP and never become ready here. Disabling (rather
@@ -254,6 +433,15 @@ mkdir -p "$RENDERED"
 for f in /manifests/*.yaml; do
   sed "s/__NODE_IP__/$NODE_IP/g" "$f" > "$RENDERED/$(basename "$f")"
 done
+# /manifests-optional is only applied when its precondition holds. The juicefs-r2
+# StorageClass must not exist without the mount behind it: local-path's helper pod
+# hostPaths its volume's parent with DirectoryOrCreate, so provisioning against a
+# missing mount would quietly land PVs on the ephemeral disk under a name that
+# promises R2.
+if [ -n "$JUICEFS_MOUNTED" ]; then
+  sed "s/__NODE_IP__/$NODE_IP/g" /manifests-optional/juicefs-storage.yaml \
+    > "$RENDERED/juicefs-storage.yaml"
+fi
 (
   for _ in $(seq 1 120); do
     if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then
@@ -263,6 +451,14 @@ done
         if /usr/local/bin/k3s kubectl apply --validate=false -f "$RENDERED"/ \
              >>"$LOG_DIR/manifests.log" 2>&1; then
           log "manifests applied (attempt $attempt)"
+          # Not applying juicefs-storage.yaml is not enough to keep the class
+          # away: a datastore restored from R2 still carries whatever
+          # StorageClasses a previous boot created. So the invariant is enforced
+          # from both ends — the class exists if and only if the mount does.
+          if [ -z "$JUICEFS_MOUNTED" ]; then
+            /usr/local/bin/k3s kubectl delete storageclass juicefs-r2 \
+              --ignore-not-found >>"$LOG_DIR/manifests.log" 2>&1
+          fi
           exit 0
         fi
         sleep 10
@@ -282,6 +478,14 @@ term() {
   kill "$K3S_PID" 2>/dev/null
   # k3s needs a moment to tear down containerd cleanly.
   wait "$K3S_PID" 2>/dev/null
+  # JuiceFS goes last, and only after k3s: unmounting while pods still hold the
+  # filesystem open would fail, and the supervisor has to be shot first or it
+  # would remount whatever we just unmounted. Anything fsynced is already in R2;
+  # this is about flushing what wasn't.
+  if [ -n "$JFS_SUP_PID" ]; then
+    kill "$JFS_SUP_PID" 2>/dev/null
+    umount "$JFS_MOUNT" 2>/dev/null || umount -l "$JFS_MOUNT" 2>/dev/null
+  fi
   kill "$STATUS_PID" 2>/dev/null
   exit 0
 }

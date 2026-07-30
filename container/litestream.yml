@@ -26,3 +26,36 @@ dbs:
       path: k3s/state
       endpoint: ${R2_ENDPOINT}
       region: auto
+
+  # JuiceFS metadata for the juicefs-r2 StorageClass. This entry is the ONLY
+  # durability the filesystem's metadata has: JuiceFS's own `--backup-meta`
+  # rotation prunes old dumps through ListObjects, and R2 does not return keys in
+  # lexicographic order, so the mount runs with `--backup-meta 0`. File *data*
+  # lives in the kubeflare-jfs bucket; without this DB those objects are
+  # unreadable — the inode tree that names them is here.
+  #
+  # A configured-but-absent path is fine: litestream's per-DB monitor no-ops
+  # until the file appears (DB.init() returns early on ENOENT), so this entry
+  # costs nothing when JuiceFS is disabled and `replicate -exec` still starts.
+  #
+  # JuiceFS opens SQLite with _journal=WAL, which is what litestream needs, and
+  # litestream's long-running read transaction blocks JuiceFS from checkpointing
+  # behind its back — the same arrangement kine's litestream mode makes explicit.
+  #
+  # It replicates into R2_BUCKET (alongside k3s/state), deliberately NOT into the
+  # JuiceFS data bucket: `juicefs format` refuses to initialise a volume whose
+  # object store is non-empty, and litestream's own keys would trip that check on
+  # a genuine first boot.
+  - path: /var/lib/kubeflare/jfs-meta.db
+    busy-timeout: 5
+    sync-interval: 10s
+    checkpoint-interval: 1m
+    snapshot:
+      interval: 1h
+      retention: 72h
+    replica:
+      type: s3
+      bucket: ${R2_BUCKET}
+      path: jfs/meta
+      endpoint: ${R2_ENDPOINT}
+      region: auto

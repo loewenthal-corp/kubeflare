@@ -23,6 +23,11 @@ def redact(text: str) -> str:
     The process table shows cloudflared's full argv, which contains the tunnel
     token. This endpoint is reachable from the internet through the Worker, so
     nothing secret may pass through here.
+
+    JuiceFS adds no new secret names — it reuses the litestream credentials — but
+    /logs/juicefs echoes the volume's bucket URL, which is R2_ENDPOINT plus a
+    bucket name. R2_ENDPOINT being in this list is what keeps the account id out
+    of that.
     """
     for var in (
         "TUNNEL_TOKEN",
@@ -65,6 +70,9 @@ PANELS = [
     ("nodes", f"{K3S} kubectl get nodes -o wide"),
     ("pods (all namespaces)", f"{K3S} kubectl get pods -A -o wide"),
     ("deployments", f"{K3S} kubectl get deploy -A"),
+    # juicefs-r2 appears here only when the JuiceFS mount came up; see
+    # /manifests-optional in entrypoint.sh.
+    ("storage", f"{K3S} kubectl get storageclass; {K3S} kubectl get pvc -A"),
     ("k3s version", f"{K3S} --version"),
     ("processes", "ps -eo pid,comm,args --sort=pid | head -40"),
     ("uname", "uname -a"),
@@ -121,6 +129,15 @@ class Handler(BaseHTTPRequestHandler):
                 ("k3s PATH", "tr '\\0' '\\n' < /proc/24/environ 2>/dev/null | grep -E '^PATH=' | head -2"),
                 ("nft ruleset size", "nft list ruleset 2>&1 | wc -l"),
                 ("nat table full", "iptables -t nat -S 2>&1 | head -30"),
+                # `juicefs status` is deliberately absent: it opens the metadata
+                # URL, and the SQLite driver CREATES the file if it is missing —
+                # an empty DB there would make the next boot skip both the
+                # litestream restore and the format and come up with no
+                # filesystem at all. Never point a juicefs subcommand at
+                # sqlite3:///var/lib/kubeflare/jfs-meta.db by hand either.
+                ("juicefs mount", "grep fuse /proc/self/mounts 2>&1 | head -5"),
+                ("juicefs free space", "df -h /mnt/juicefs 2>&1"),
+                ("juicefs metadata db", "ls -la /var/lib/kubeflare/ 2>&1 | head -10"),
                 ("local kubectl exec (server-side)",
                  f"POD=$({K3S} kubectl get pod -l app=nginx -o jsonpath='{{.items[0].metadata.name}}'); "
                  f"{K3S} kubectl exec $POD -- sh -c 'hostname; echo SERVER_SIDE_EXEC_OK'"),
@@ -167,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
             nav("/logs/kubectl-proxy", "kubectl proxy log"),
             nav("/logs/cloudflared", "cloudflared log"),
             nav("/logs/manifests", "manifests log"),
+            nav("/logs/juicefs", "juicefs log"),
             nav("/diag", "diagnostics"),
             nav("/nodes", "nodes"),
             nav("/pods", "pods"),

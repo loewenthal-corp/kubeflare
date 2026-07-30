@@ -1,0 +1,28 @@
+# Litestream replicates kine's SQLite database to R2, and restores it on boot,
+# so the cluster survives the ephemeral disk. See entrypoint.sh for the
+# restore/replicate orchestration and the identity story (K3S_TOKEN,
+# K3S_NODE_PASSWORD).
+#
+# Credentials come from LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY
+# (litestream's native env vars); endpoint and bucket from R2_ENDPOINT /
+# R2_BUCKET. All four arrive as Worker secrets passed through the Durable
+# Object (src/index.ts).
+#
+# sync-interval is the durability/cost dial: kine is never idle (leases every
+# few seconds), so nearly every interval uploads one R2 class A write.
+#   10s ≈ 360k writes/mo — inside R2's 1M free tier; 10s crash-loss window.
+#    1s ≈ 2.7M writes/mo — ≈ $8/mo; 1s loss window.
+dbs:
+  - path: /var/lib/rancher/k3s/server/db/state.db
+    busy-timeout: 5
+    sync-interval: 10s
+    checkpoint-interval: 1m
+    snapshot:
+      interval: 1h
+      retention: 72h
+    replica:
+      type: s3
+      bucket: ${R2_BUCKET}
+      path: k3s/state
+      endpoint: ${R2_ENDPOINT}
+      region: auto

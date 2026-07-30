@@ -20,13 +20,21 @@
     "KUBE_PROXY_MODE": "nftables",
     // Only needed if you wire up a Cloudflare Tunnel (docs/TUNNEL.md). It is
     // added to the apiserver certificate's SANs.
-    "TUNNEL_HOSTNAME": ""
+    "TUNNEL_HOSTNAME": "",
+    // R2 bucket for durable cluster state (litestream). The bucket name is not
+    // sensitive; the endpoint (it embeds your account id) and credentials are
+    // Worker secrets — deploy.sh prints instructions.
+    "R2_BUCKET": "kubeflare-state"
   },
 
   "containers": [
     {
       "class_name": "KubeFlare",
       "image": "./container/Dockerfile",
+      // The build context defaults to the Dockerfile's directory, which cannot
+      // see svcproxy/ — so it is the repo root, and COPY paths in the
+      // Dockerfile are repo-relative.
+      "image_build_context": ".",
       "max_instances": 1,
       // 2 vCPU / 8 GiB / 16 GB. Constraints: >= 3 GiB memory per vCPU, and
       // <= 2 GB disk per GiB memory. containerd needs the disk to unpack images.

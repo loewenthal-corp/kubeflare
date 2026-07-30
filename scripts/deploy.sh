@@ -43,6 +43,42 @@ printf '%s' "$GUARD" | npx wrangler secret put KUBE_GUARD >/dev/null 2>&1 \
   || die "could not set the KUBE_GUARD secret"
 info "stored as the KUBE_GUARD Worker secret"
 
+# Cluster identity secrets. K3S_TOKEN encrypts the bootstrap data (CA certs,
+# service-account signing key) INSIDE the datastore; K3S_NODE_PASSWORD is how
+# the node re-authenticates to its restored identity. Both must stay stable
+# across deploys, or a litestream-restored state DB is undecryptable — so they
+# are persisted locally (gitignored) and reused.
+ensure_secret() {
+  local name=$1 file=$2 val
+  if [ -s "$file" ]; then
+    val=$(cat "$file")
+    info "reusing $name"
+  else
+    val=$(openssl rand -hex 32)
+    printf '%s' "$val" > "$file" && chmod 600 "$file"
+    info "generated a new $name"
+  fi
+  printf '%s' "$val" | npx wrangler secret put "$name" >/dev/null 2>&1 \
+    || die "could not set the $name secret"
+}
+ensure_secret K3S_TOKEN .kubeflare-k3s-token
+ensure_secret K3S_NODE_PASSWORD .kubeflare-node-password
+
+# Durable state is opt-in: it needs R2 S3 credentials, which only you can mint.
+have_secret() { npx wrangler secret list 2>/dev/null | grep -q "\"$1\""; }
+if have_secret LITESTREAM_ACCESS_KEY_ID && have_secret LITESTREAM_SECRET_ACCESS_KEY && have_secret R2_ENDPOINT; then
+  info "durable state: R2 secrets present — litestream replication is ON"
+else
+  info "durable state: OFF (cluster state is wiped on sleep/rollout)."
+  info "  To enable: dash.cloudflare.com → R2 → Manage API tokens → Create API token"
+  info "  (Object Read & Write, scoped to the kubeflare-state / kubeflare-jfs /"
+  info "  kubeflare-registry buckets — one token covers state, volumes, and images), then:"
+  info "    npx wrangler secret put LITESTREAM_ACCESS_KEY_ID      # token's Access Key ID"
+  info "    npx wrangler secret put LITESTREAM_SECRET_ACCESS_KEY  # token's Secret Access Key"
+  info "    npx wrangler secret put R2_ENDPOINT                   # https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+  info "  and re-run ./scripts/deploy.sh"
+fi
+
 # ---------------------------------------------------------------- 3. deploy
 bold "3/5  Building the image and deploying (first build takes a few minutes)"
 # --containers-rollout=immediate is REQUIRED for a single-instance app: the

@@ -4,6 +4,18 @@
 # Firecracker microVMs where PID 1 is uid 0 with all 41 capabilities, no seccomp
 # filter, full cgroup v2 delegation, /dev/net/tun, /dev/fuse and working netfilter.
 # So none of the rootless contortions are needed: this runs stock k3s.
+#
+# NOTE: the build context is the REPO ROOT (wrangler.jsonc sets
+# image_build_context), because svcproxy/ lives outside container/. Every COPY
+# path here is therefore repo-relative.
+
+# svcproxy: the userspace ClusterIP proxy (this kernel can run no kube-proxy
+# backend — see docs/FINDINGS.md §5.2 and svcproxy/README.md).
+FROM golang:1.26 AS svcproxy-build
+WORKDIR /src
+COPY svcproxy/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/kubeflare-svcproxy .
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -35,9 +47,28 @@ RUN set -eux; \
     chmod +x /usr/local/bin/cloudflared; \
     /usr/local/bin/k3s --version
 
-COPY entrypoint.sh /entrypoint.sh
-COPY status-server.py /status-server.py
-COPY manifests/ /manifests/
+# Litestream replicates kine's SQLite DB to R2 so the cluster survives the
+# ephemeral disk. 0.5.x is the LTX rewrite; pin a recent patch release —
+# restore-correctness fixes were still landing through 0.5.12.
+ARG LITESTREAM_VERSION=0.5.15
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) ls_arch=x86_64 ;; \
+      arm64) ls_arch=arm64 ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/litestream.tar.gz \
+      "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION}-linux-${ls_arch}.tar.gz"; \
+    tar -C /usr/local/bin -xzf /tmp/litestream.tar.gz litestream; \
+    rm /tmp/litestream.tar.gz; \
+    /usr/local/bin/litestream version
+
+COPY --from=svcproxy-build /out/kubeflare-svcproxy /usr/local/bin/kubeflare-svcproxy
+COPY container/entrypoint.sh /entrypoint.sh
+COPY container/status-server.py /status-server.py
+COPY container/litestream.yml /etc/litestream.yml
+COPY container/manifests/ /manifests/
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 8080

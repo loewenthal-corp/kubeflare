@@ -32,6 +32,73 @@ sysctl -w net.bridge.bridge-nf-call-iptables=1 >>"$LOG_DIR/entrypoint.log" 2>&1 
 NODE_NAME="${NODE_NAME:-cf-$(hostname)}"
 TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-}"
 
+# The guest's primary interface is cfeth0, observed stable at 10.0.0.1/24.
+# Detect it anyway so a platform change degrades to a log line, not a broken
+# cluster. Everything that must dodge ClusterIP (coredns, local-path, kubelet
+# --cluster-dns) is pointed at this address.
+NODE_IP=$(ip -4 -o addr show cfeth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+if [ -z "$NODE_IP" ]; then
+  NODE_IP=10.0.0.1
+  log "cfeth0 not found; assuming NODE_IP=$NODE_IP"
+else
+  log "node ip $NODE_IP (cfeth0)"
+fi
+
+# ---------------------------------------------------------------- durable state
+# Litestream replicates kine's SQLite DB to R2 and restores it on boot, so the
+# cluster survives the ephemeral disk. Enabled only when all the secrets are
+# present; otherwise the cluster rebuilds from scratch on every boot as before.
+#
+# The DB alone is not identity. k3s encrypts its bootstrap data (CA certs, SA
+# signing key, credential files) INTO the datastore, keyed by the join token —
+# so K3S_TOKEN must be a fixed secret or a restored DB is undecryptable. The
+# agent's node password lives OUTSIDE the DB but is validated against an
+# immutable in-cluster secret named after the node, so it is seeded from
+# K3S_NODE_PASSWORD and the node name is pinned (container hostnames are not
+# contractual across instances).
+LITESTREAM_ENABLED=""
+if [ -n "${LITESTREAM_ACCESS_KEY_ID:-}" ] && [ -n "${LITESTREAM_SECRET_ACCESS_KEY:-}" ] \
+   && [ -n "${R2_ENDPOINT:-}" ] && [ -n "${R2_BUCKET:-}" ]; then
+  if [ -z "${K3S_TOKEN:-}" ] || [ -z "${K3S_NODE_PASSWORD:-}" ]; then
+    log "litestream: R2 secrets present but K3S_TOKEN/K3S_NODE_PASSWORD missing; staying ephemeral"
+  else
+    LITESTREAM_ENABLED=yes
+  fi
+fi
+
+K3S_DB=/var/lib/rancher/k3s/server/db/state.db
+DATASTORE_ARGS=()
+if [ -n "$LITESTREAM_ENABLED" ]; then
+  NODE_NAME=kubeflare
+  # kine's litestream mode (kine >= 0.16.1, vendored in this k3s) disables its
+  # own WAL checkpointing and startup VACUUM so litestream can own the WAL.
+  DATASTORE_ARGS=(--datastore-endpoint=litestream://)
+
+  mkdir -p /etc/rancher/node "$(dirname "$K3S_DB")"
+  printf '%s' "$K3S_NODE_PASSWORD" > /etc/rancher/node/password
+  chmod 600 /etc/rancher/node/password
+
+  # Restore semantics: -if-db-not-exists makes in-place k3s restarts a no-op;
+  # -if-replica-exists exits 0 on a genuinely empty bucket (true first boot).
+  # Any OTHER failure must abort the container: starting k3s with a fresh DB
+  # while a replica exists would mint a new cluster AND poison the replica.
+  restored=""
+  for attempt in 1 2 3 4 5; do
+    if litestream restore -config /etc/litestream.yml \
+         -if-db-not-exists -if-replica-exists "$K3S_DB" \
+         >>"$LOG_DIR/litestream.log" 2>&1; then
+      restored=yes; break
+    fi
+    log "litestream restore attempt $attempt failed; retrying (see litestream.log)"
+    sleep $((attempt * 2))
+  done
+  if [ -z "$restored" ]; then
+    log "FATAL: could not restore or verify the R2 replica; refusing to start a fresh cluster over it"
+    exit 1
+  fi
+  log "litestream: restore step complete (node=$NODE_NAME)"
+fi
+
 SAN_ARGS=(--tls-san 127.0.0.1 --tls-san localhost)
 [ -n "$TUNNEL_HOSTNAME" ] && SAN_ARGS+=(--tls-san "$TUNNEL_HOSTNAME")
 
@@ -61,18 +128,48 @@ if [ "$PROXY_MODE" != "iptables" ]; then
   NET_ARGS+=(--kube-proxy-arg="proxy-mode=$PROXY_MODE")
 fi
 
+# Cluster DNS without kube-proxy: pods get the node IP as their nameserver,
+# where the vendored hostNetwork coredns (manifests/coredns.yaml) listens.
+# The default (a ClusterIP, 10.43.0.10) is unroutable until svcproxy is up, and
+# DNS has to work before that.
+#
+# k3s's own --cluster-dns is documented as needing an address inside the service
+# CIDR, which the node IP is not; going through --kubelet-arg sets the kubelet
+# field directly and is verified working (pods resolve cluster + internet names).
+# NodeLocal DNSCache does the same thing upstream with a link-local address.
+NET_ARGS+=(--kubelet-arg=cluster-dns="$NODE_IP")
+
 # ---------------------------------------------------------------- k3s
 start_k3s() {
-  log "starting k3s server (node=$NODE_NAME, flannel=$FLANNEL_BACKEND, sans=${TUNNEL_HOSTNAME:-none})"
-  /usr/local/bin/k3s server \
-    --node-name "$NODE_NAME" \
-    --disable traefik,servicelb,metrics-server \
+  log "starting k3s server (node=$NODE_NAME, flannel=$FLANNEL_BACKEND, litestream=${LITESTREAM_ENABLED:-no})"
+  # coredns and local-storage are disabled in favour of the vendored copies in
+  # /manifests: the packaged ones talk to the apiserver via the
+  # kubernetes.default ClusterIP and never become ready here. Disabling (rather
+  # than live-patching) matters because k3s's addon reconciler restores the
+  # packaged manifests on every start.
+  #
+  # None of the array values contain whitespace, so flattening with [*] into
+  # litestream's -exec string is safe.
+  # --disable-kube-proxy: no backend can program this kernel (FINDINGS §5.2);
+  # svcproxy below implements ClusterIP in userspace instead, and a half-failed
+  # kube-proxy sync would only leave stray nft tables around.
+  K3S_CMD="/usr/local/bin/k3s server \
+    --node-name $NODE_NAME \
+    --disable traefik,servicelb,metrics-server,coredns,local-storage \
+    --disable-kube-proxy \
     --write-kubeconfig-mode 644 \
-    "${SAN_ARGS[@]}" \
-    "${NET_ARGS[@]}" \
-    ${K3S_EXTRA_ARGS:-} \
-    >>"$LOG_DIR/k3s.log" 2>&1 &
-  K3S_PID=$!
+    ${SAN_ARGS[*]} ${NET_ARGS[*]} ${DATASTORE_ARGS[*]:-} ${K3S_EXTRA_ARGS:-}"
+  if [ -n "$LITESTREAM_ENABLED" ]; then
+    # The fly.io pattern: litestream supervises k3s, exits when it exits, and
+    # forwards signals — so the WAL is never left unreplicated while k3s runs
+    # (kine's own checkpointing is off in litestream mode).
+    litestream replicate -config /etc/litestream.yml -exec "$K3S_CMD" \
+      >>"$LOG_DIR/k3s.log" 2>&1 &
+    K3S_PID=$!
+  else
+    $K3S_CMD >>"$LOG_DIR/k3s.log" 2>&1 &
+    K3S_PID=$!
+  fi
   log "k3s pid=$K3S_PID"
 }
 start_k3s
@@ -107,6 +204,30 @@ start_kproxy() {
 }
 start_kproxy &
 
+# ---------------------------------------------------------------- svcproxy
+# Userspace ClusterIP: binds every Service's ClusterIP directly via an AnyIP
+# local route on the service CIDR and proxies TCP/UDP to ready endpoints. This
+# is what makes ClusterIP (and therefore most real workloads) function on a
+# kernel where every kube-proxy backend is missing something. Self-supervising:
+# the subshell restarts it if it exits.
+(
+  for _ in $(seq 1 120); do
+    if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then
+      log "starting svcproxy"
+      while true; do
+        /usr/local/bin/kubeflare-svcproxy \
+          --kubeconfig /etc/rancher/k3s/k3s.yaml \
+          --service-cidr 10.43.0.0/16 \
+          >>"$LOG_DIR/svcproxy.log" 2>&1
+        log "svcproxy exited (see svcproxy.log); restarting in 5s"
+        sleep 5
+      done
+    fi
+    sleep 5
+  done
+  log "svcproxy not started: apiserver never ready"
+) &
+
 # ---------------------------------------------------------------- cloudflared
 CFD_PID=""
 start_cloudflared() {
@@ -124,22 +245,29 @@ start_cloudflared() {
 }
 start_cloudflared
 
-# ---------------------------------------------------------------- demo workload
-# Applied once the API server is serving, so the dashboard has something to show.
+# ---------------------------------------------------------------- manifests
+# Cluster add-ons (coredns, local-path storage) plus the demo workload, applied
+# once the API server is serving. /manifests is baked into the image read-only;
+# render the __NODE_IP__ placeholder first.
+RENDERED=/run/kubeflare-manifests
+mkdir -p "$RENDERED"
+for f in /manifests/*.yaml; do
+  sed "s/__NODE_IP__/$NODE_IP/g" "$f" > "$RENDERED/$(basename "$f")"
+done
 (
   for _ in $(seq 1 120); do
     if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then
       # /readyz goes ok before the aggregated openapi endpoint is serving, and
       # client-side validation fetches openapi — hence --validate=false plus a retry.
       for attempt in $(seq 1 20); do
-        if /usr/local/bin/k3s kubectl apply --validate=false -f /manifests/ \
+        if /usr/local/bin/k3s kubectl apply --validate=false -f "$RENDERED"/ \
              >>"$LOG_DIR/manifests.log" 2>&1; then
-          log "demo manifests applied (attempt $attempt)"
+          log "manifests applied (attempt $attempt)"
           exit 0
         fi
         sleep 10
       done
-      log "demo manifests FAILED after 20 attempts (see manifests.log)"
+      log "manifests FAILED after 20 attempts (see manifests.log)"
       exit 1
     fi
     sleep 5

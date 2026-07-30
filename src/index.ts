@@ -1,4 +1,4 @@
-import { Container, getContainer } from "@cloudflare/containers";
+import { Container, getContainer, switchPort } from "@cloudflare/containers";
 
 /**
  * Durable Object that owns the single kubeflare container instance.
@@ -17,6 +17,15 @@ export class KubeFlare extends Container<Env> {
     TUNNEL_HOSTNAME: this.env.TUNNEL_HOSTNAME ?? "",
     FLANNEL_BACKEND: this.env.FLANNEL_BACKEND ?? "host-gw",
     KUBE_PROXY_MODE: this.env.KUBE_PROXY_MODE ?? "nftables",
+    // Durable state (litestream → R2). All-or-nothing: the entrypoint enables
+    // replication only when every one of these is non-empty; otherwise the
+    // cluster stays ephemeral. See scripts/deploy.sh for how they get set.
+    LITESTREAM_ACCESS_KEY_ID: this.env.LITESTREAM_ACCESS_KEY_ID ?? "",
+    LITESTREAM_SECRET_ACCESS_KEY: this.env.LITESTREAM_SECRET_ACCESS_KEY ?? "",
+    R2_ENDPOINT: this.env.R2_ENDPOINT ?? "",
+    R2_BUCKET: this.env.R2_BUCKET ?? "",
+    K3S_TOKEN: this.env.K3S_TOKEN ?? "",
+    K3S_NODE_PASSWORD: this.env.K3S_NODE_PASSWORD ?? "",
   };
 
   override onStart() {
@@ -37,6 +46,12 @@ interface Env {
   FLANNEL_BACKEND?: string;
   KUBE_PROXY_MODE?: string;
   KUBE_GUARD?: string;
+  LITESTREAM_ACCESS_KEY_ID?: string;
+  LITESTREAM_SECRET_ACCESS_KEY?: string;
+  R2_ENDPOINT?: string;
+  R2_BUCKET?: string;
+  K3S_TOKEN?: string;
+  K3S_NODE_PASSWORD?: string;
 }
 
 const INSTANCE = "main";
@@ -84,12 +99,26 @@ export default {
     // authenticates with --token=$KUBE_GUARD; we forward to the container's
     // `kubectl proxy`, which holds the real cluster credentials.
     //
-    // The original Request object is forwarded untouched: building a new one
-    // would drop the Upgrade handling that exec/attach/port-forward need. The
-    // container runs `kubectl proxy --api-prefix=/k8s/` so no path rewrite is
-    // required here.
+    // MUST go through the DO's fetch boundary (container.fetch + switchPort),
+    // NOT containerFetch: containerFetch is a JSRPC method, and a Response
+    // carrying a WebSocket cannot cross the RPC boundary — it throws
+    // DataCloneError, which is exactly how kubectl exec/attach/port-forward
+    // (WebSocket transport, default since kubectl 1.31) used to die here.
+    // kubectl then silently falls back to SPDY, which the edge 400s, so the
+    // real error never surfaced. switchPort only adds a header; the URL is
+    // untouched, which `kubectl proxy --api-prefix=/k8s/` relies on.
     if (url.pathname === "/k8s" || url.pathname.startsWith("/k8s/")) {
-      return container.containerFetch(request, KUBE_PROXY_PORT);
+      try {
+        return await container.fetch(switchPort(request, KUBE_PROXY_PORT));
+      } catch (err) {
+        // Surface real errors instead of an opaque Cloudflare 1101 page.
+        const e = err as Error;
+        console.log("k8s passthrough error:", String(err), e?.stack ?? "");
+        return new Response(`kubeflare: /k8s passthrough failed\n\n${String(err)}\n`, {
+          status: 502,
+          headers: { "content-type": "text/plain" },
+        });
+      }
     }
 
     try {

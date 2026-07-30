@@ -24,7 +24,15 @@ def redact(text: str) -> str:
     token. This endpoint is reachable from the internet through the Worker, so
     nothing secret may pass through here.
     """
-    for var in ("TUNNEL_TOKEN", "KUBE_GUARD"):
+    for var in (
+        "TUNNEL_TOKEN",
+        "KUBE_GUARD",
+        "K3S_TOKEN",
+        "K3S_NODE_PASSWORD",
+        "LITESTREAM_ACCESS_KEY_ID",
+        "LITESTREAM_SECRET_ACCESS_KEY",
+        "R2_ENDPOINT",
+    ):
         val = os.environ.get(var)
         if val and len(val) > 6:
             text = text.replace(val, f"<{var}:REDACTED>")

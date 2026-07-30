@@ -1,0 +1,30 @@
+# The container build context is the repo root (wrangler.jsonc sets
+# image_build_context) so that the Dockerfile can reach svcproxy/. Keep
+# everything else out of the context — especially node_modules, which would add
+# hundreds of megabytes to every build, and the local credential files.
+node_modules/
+.git/
+.wrangler/
+.vscode/
+.github/
+docs/
+probe/
+scripts/
+src/
+package.json
+package-lock.json
+wrangler.jsonc
+README.md
+LICENSE
+kubeconfig.yaml
+tunnel-kubeconfig.yaml
+.kubeflare-token
+.kubeflare-k3s-token
+.kubeflare-node-password
+.dev.vars
+*.log
+*.pem
+.DS_Store
+
+# Host-built binaries must never leak into the image; it builds its own.
+svcproxy/svcproxy

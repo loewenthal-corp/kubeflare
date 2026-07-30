@@ -70,52 +70,54 @@ Cold start takes about 90 seconds. `./scripts/teardown.sh --yes` removes everyth
 - The kubelet on containerd 2.3.2 with cgroup v2, reporting 2 CPUs, 8Gi of memory, and room for 110 pods.
 - Image pulls from Docker Hub over the container's normal egress.
 - Pod networking through flannel in host-gw mode: a `cni0` bridge, veth pairs, pod IPs in 10.42.0.0/24, pod-to-pod traffic. No `hostNetwork` shortcuts.
+- **ClusterIP Services**, via `svcproxy/` — a userspace kube-proxy replacement. Pod → ClusterIP, pod → `kubernetes:443`, and Service DNS names all work, with even round-robin across endpoints.
+- **Cluster DNS.** A vendored coredns runs on the host network and kubelet hands pods the node IP as their nameserver, so DNS works before (and independently of) svcproxy. The `kube-dns` ClusterIP works too, for charts that hardcode it.
+- **PersistentVolumeClaims.** A vendored local-path-provisioner (apiserver reached via the node IP) provisions RWO volumes on the node disk. Ephemeral until you enable durable state (below).
+- **`kubectl exec`, `attach`, `port-forward`, `cp`** — over the WebSocket transport that has been kubectl's default since 1.31, straight through the Worker. No tunnel required.
 - `kubectl` from anywhere: get, create, apply, scale, delete, logs, describe, rollout.
-- Self-healing. A supervisor restarts k3s if it dies, and after a disk wipe the cluster rebuilds itself unattended.
+- Self-healing. A supervisor restarts k3s if it dies, and after a disk wipe the cluster rebuilds itself unattended — or restores itself from R2 if durable state is on.
 
-## What doesn't
+## What doesn't (yet)
 
 Every entry below is a kernel gap, and the kernel takes no modules: there is no `/lib/modules` and no `/proc/modules`, so whatever isn't compiled in doesn't exist.
 
 | Broken | Root cause |
 |---|---|
-| ClusterIP Services | kube-proxy can't program rules in either backend (below) |
-| Cluster DNS | downstream of the above: coredns needs to reach `kubernetes.default`, which is a ClusterIP |
+| kube-proxy, all four backends | this kernel is missing something for each one (below) — worked around in userspace, see `svcproxy/` |
+| NodePort / `type: LoadBalancer` | no inbound TCP reaches the container except through the Worker; svcproxy serves the ClusterIP only |
+| Source IP preservation | svcproxy re-originates connections, so backends see the node address |
+| `sessionAffinity: ClientIP` | not implemented by svcproxy (ignored with a warning) |
 | flannel vxlan | `failed to create vxlan device: operation not supported`, hence host-gw |
-| `kubectl exec` / `port-forward` | Cloudflare's edge won't switch protocols to `Upgrade: SPDY/3.1` |
 | Multi-node | no vxlan device and no inbound UDP, so no cross-node overlay |
 
-kube-proxy is the crux, and it fails in both of its backends.
+kube-proxy is the crux, and every one of its backends loses to this kernel:
 
-In iptables mode, the `KUBE-FORWARD` chain includes an `nfacct` counter rule, and the kernel has no `xt_nfacct`:
+- **iptables mode** — the famous failure is the `nfacct` counter rule (`xt_nfacct` missing), and that one actually has an off-switch (`--conntrack-tcp-be-liberal=true` skips the rule). But probing the deployed kernel shows **`xt_statistic` is missing too**, and that is how kube-proxy spreads traffic across a service's endpoints. `iptables-restore` is transactional: one multi-endpoint service and the entire sync fails. Dead.
+- **nftables mode** — the kernel lacks the `reject` and `numgen` nft expressions. `reject` sits in the base ruleset kube-proxy installs unconditionally, `numgen` is its DNAT load-balancer. Dead.
+- **IPVS** — `/proc/net/ip_vs` doesn't exist, and the mode is deprecated upstream anyway. Dead.
+- **eBPF (Cilium et al.)** — `/sys/kernel/btf/vmlinux` doesn't exist, and modern Cilium is CO-RE/BTF-only. Dead.
 
-```
-Warning: Extension nfacct revision 0 not supported, missing kernel module?
-line 9: RULE_APPEND failed (No such file or directory): rule in chain KUBE-FORWARD
-```
+What *does* work is Linux AnyIP: `ip route replace local 10.43.0.0/16 dev lo` makes the whole
+service CIDR locally bindable with a plain `bind()`. So instead of rewriting packets,
+[`svcproxy/`](svcproxy/) listens on every `ClusterIP:port` and forwards bytes in userspace — a
+~800-line Go daemon watching Services and EndpointSlices, TCP and UDP, round-robin over ready
+endpoints. k3s runs with `--disable-kube-proxy` and this takes its place.
 
-`iptables-restore` is transactional. One rule fails, the whole sync fails, and kube-proxy ends up programming no service rules at all.
-
-In nftables mode, the kernel is missing the `reject` and `numgen` nft expressions:
-
-```
-add rule ip kube-proxy reject-chain reject
-                                    ^^^^^^  Could not process rule
-add rule ip kube-proxy service-… dnat ip addr . port to numgen random mod 1 map { … }
-                                                        ^^^^^^^^^^^^^^^^^^  Could not process rule
-```
-
-`numgen` is how kube-proxy spreads DNAT across a service's endpoints, so there is no easy way around it.
-
-Measured from inside a pod:
+Measured from inside a pod, before and after:
 
 ```
-pod → pod  direct (10.42.0.5)  : http 200
-pod → ClusterIP nginx           : timed out
-pod → ClusterIP kubernetes:443  : timed out
+                                   before          after
+pod → pod direct (10.42.0.5)       http 200        http 200
+pod → ClusterIP nginx              timed out       http 200
+pod → ClusterIP kubernetes:443     timed out       /version OK
+DNS via kube-dns ClusterIP         timed out       resolves
+http://nginx.default.svc...        n/a             http 200
+6 requests across 3 endpoints      n/a             2 / 2 / 2
 ```
 
-Three kernel config flags separate this from a fully working single-node cluster: `xt_nfacct`, nft `reject`, nft `numgen`. If you work on Cloudflare's guest kernel, that's the wishlist.
+Kernel wishlist for Cloudflare, which would let a stock kube-proxy run and delete `svcproxy/`
+entirely: `xt_nfacct`, `xt_statistic`, nft `reject`, nft `numgen`, plus `vxlan` and BTF for the
+rest of the gaps.
 
 ## How it works
 
@@ -134,12 +136,13 @@ Cloudflare Containers accept no raw TCP from outside; everything arrives through
 
 The workaround is to run `kubectl proxy` inside the container. It terminates the apiserver's TLS locally using the node's own admin credentials and re-exposes the same API as plain HTTP. The Worker forwards `/k8s/*` to it, gated by a bearer token, and `kubectl` on your machine treats the Worker's URL as the API server.
 
-Two flags make this viable:
+Three details make this viable:
 
-- `--api-prefix=/k8s/`, so the Worker can forward the original `Request` object untouched. Rewriting the URL means building a new `Request`, which drops the upgrade semantics `exec` needs.
+- `--api-prefix=/k8s/`, so the Worker forwards the request without rewriting the URL.
 - `--reject-paths=''`, because the default reject list blocks `pods/exec` and `pods/attach` outright.
+- The Worker forwards `/k8s/*` through the Durable Object's **fetch** boundary (`container.fetch(switchPort(...))`), never `containerFetch()`. `containerFetch` is a JSRPC method, and a Response carrying a WebSocket cannot cross an RPC boundary (`DataCloneError`) — that, not the edge, is what used to kill `kubectl exec`: kubectl has defaulted to WebSockets since 1.31, the WS dial died in the Worker, and kubectl silently fell back to SPDY, which the edge refuses. With the fetch boundary, `exec`, `attach`, `port-forward`, and `cp` all work through the Worker.
 
-There's also a [Cloudflare Tunnel path](docs/TUNNEL.md) that carries native TLS to 6443 and should bring back `exec` and `port-forward`. It needs a DNS record, so it isn't the default.
+There's also a [Cloudflare Tunnel path](docs/TUNNEL.md) that carries native TLS all the way to 6443 — `scripts/tunnel-setup.sh` automates it end to end given an API token with `Cloudflare Tunnel: Edit` + `DNS: Edit`. It's the transport-independent fallback and the basis for WARP private networking; it needs a domain, so it isn't the default.
 
 ### On running this in production
 
@@ -147,8 +150,9 @@ It's a free country. I'm not going to pretend to know what you're building; if y
 
 - The `/k8s` passthrough collapses cluster-admin into a single bearer token. Whoever holds it owns the cluster. No users, no RBAC mapping, no audit trail beyond the apiserver's own.
 - Everything except `/healthz` requires that token, and the dashboard redacts known secrets from command output. That is the entire security model.
-- The disk is ephemeral, so anything you don't replicate off-box is gone on the next restart.
-- ClusterIP Services and cluster DNS don't work at all, which rules out most real workloads before security even comes up.
+- Cluster state survives restarts only if you enable the R2 replication above. Everything on a PersistentVolume does not — those live on the ephemeral disk.
+- Services work through a userspace proxy, not the kernel. Backends never see real client IPs, which breaks NetworkPolicy-by-source and any app-level IP allowlist. Throughput is a userspace copy per connection.
+- One node, and it can go away at any time. There is no HA story here at all.
 
 MIT licensed, no warranty, see [LICENSE](LICENSE).
 
@@ -164,25 +168,61 @@ Cloudflare bills containers per 10ms of active runtime. For the 2 vCPU / 8 GiB /
 
 Call it $2 a day if you leave it running. The Workers Paid plan includes 25 GiB-hours of memory, 375 vCPU-minutes, and 200 GB-hours of disk per month, which covers roughly the first 3 hours of uptime at no cost beyond the $5 base. A demo costs nothing; an always-on cluster is about $65/month.
 
-After `sleepAfter` (2 hours here) the container sleeps and active-runtime billing stops. Sleeping also wipes the disk; the cluster rebuilds itself from the baked-in manifests on the next request.
+After `sleepAfter` (2 hours here) the container sleeps and active-runtime billing stops. Sleeping also wipes the disk; the cluster rebuilds itself from the baked-in manifests on the next request, or restores from R2 if durable state is on. R2 adds a few cents a month at the default 10s sync interval.
 
 ## Gotchas
 
 - Pass `--containers-rollout=immediate` on every deploy of a single-instance app. The default rollout is `[10, 100]`, and 10% of one instance rounds down to zero, so deploys silently keep serving the old image. This cost hours to notice; `scripts/deploy.sh` always passes it.
-- The disk is ephemeral. Every rollout, sleep, or eviction wipes cluster state, including the k3s CA.
+- The disk is ephemeral. Every rollout, sleep, or eviction wipes cluster state, including the k3s CA — unless R2 replication is on, in which case the CA rides inside the replicated datastore.
+- A deploy does not swap the running instance instantly. `wrangler containers info <id>` shows the rollout state; a fresh instance takes ~40s to appear and the cluster another ~60s. Watching `kubectl` alone will show you the *old* cluster and mislead you.
 - Local Docker testing will mislead you. Docker's default seccomp profile denies `unshare(CLONE_NEWUSER)`, masks `/proc`, and omits `/dev/kmsg`, `/dev/fuse`, and `/dev/net/tun`, all of which Cloudflare provides. A local run sends you down a rootless path the platform never required. Trust deployed instances only.
 - The k3s version is pinned to `v1.36.2+k3s1`. The `update.k3s.io` channel endpoint answers with a 302 to an HTML page rather than JSON, and the `+` in the tag has to be percent-encoded as `%2B`.
-- `wrangler`'s OAuth token has no DNS permission, which is why the tunnel setup isn't automated.
+- `wrangler`'s OAuth token has no DNS permission and cannot mint R2 S3 credentials. The tunnel (`scripts/tunnel-setup.sh`) needs a custom API token (Account: `Cloudflare Tunnel: Edit` + Zone: `DNS: Edit`); durable state needs an R2 API token from the dashboard.
+- k3s's addon reconciler restores its packaged manifests on every start — live `kubectl patch`es of packaged components (coredns, local-path) do not stick. That's why both are vendored in `container/manifests/` with `--disable coredns,local-storage`.
+
+## Durable state (Litestream → R2)
+
+The disk is ephemeral, but the cluster doesn't have to be. When the R2 secrets are
+present, the entrypoint restores kine's SQLite database from R2 before k3s starts and
+replicates it continuously afterwards (`litestream replicate -exec`). k3s runs with
+`--datastore-endpoint=litestream://`, kine's purpose-built mode that hands WAL
+checkpointing over to litestream.
+
+Identity survives too: k3s stores its CA certs and service-account signing key
+*inside* the datastore, encrypted with the join token — so `deploy.sh` pins
+`K3S_TOKEN` and `K3S_NODE_PASSWORD` as stable Worker secrets (persisted locally,
+gitignored), and the node name is pinned while replication is on. A brand-new
+container decrypts the restored DB and comes back as the *same* cluster: same CA,
+same kubeconfigs, same Secrets.
+
+To turn it on: create an R2 API token (dashboard → R2 → Manage API tokens, Object
+Read & Write on the `kubeflare-state` bucket) and set three secrets:
+
+```bash
+npx wrangler secret put LITESTREAM_ACCESS_KEY_ID
+npx wrangler secret put LITESTREAM_SECRET_ACCESS_KEY
+npx wrangler secret put R2_ENDPOINT   # https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+```
+
+then redeploy. Without them the cluster stays ephemeral, exactly as before. The
+sync interval (10s default, `container/litestream.yml`) is the durability/cost
+dial: 10s stays inside R2's free tier; 1s costs ≈ $8/month.
 
 ## Roadmap
 
 Roughly in order of value:
 
-- [ ] Cluster DNS without kube-proxy: run coredns with `hostNetwork: true` and point kubelets at it with `--cluster-dns=<node IP>`. Would make the cluster genuinely useful for hostNetwork workloads. Untested, but the theory is sound.
-- [ ] A userspace Service implementation to route around the missing netfilter features.
-- [ ] Make the tunnel path the default, restoring `exec`, `attach`, and `port-forward`.
-- [ ] Litestream replication of the kine SQLite database to R2, so a cluster survives the disk.
-- [ ] Persist the cluster CA across restarts so exported kubeconfigs keep working.
+- [x] Cluster DNS without kube-proxy — vendored hostNetwork coredns + `--kubelet-arg=cluster-dns=<node IP>`.
+- [x] `exec` / `attach` / `port-forward` through the Worker — WebSocket transport via the DO fetch boundary.
+- [x] Litestream replication of the kine SQLite database to R2 (opt-in, needs an R2 token).
+- [x] Persist the cluster CA across restarts — the CA rides inside the replicated datastore; token + node password pinned by deploy.sh.
+- [x] ClusterIP without kube-proxy — `svcproxy/`, a userspace Service proxy on AnyIP-bound ClusterIPs.
+- [ ] Source-IP preservation and `sessionAffinity: ClientIP` in svcproxy; NodePort via the Worker.
+- [ ] R2-backed PersistentVolumes: JuiceFS (host mount, SQLite metadata on the same litestream pipeline) + a `juicefs-r2` StorageClass.
+- [ ] R2-backed image cache: `registry:3` pull-through proxy on the s3 driver, `registries.yaml` mirror — cold boots stop re-pulling from Docker Hub.
+- [ ] WARP private networking: route `10.42.0.0/15` through the tunnel so an enrolled laptop reaches pod/service IPs directly.
+- [ ] `type: LoadBalancer` via a controller that provisions Cloudflare Tunnel public hostnames per Service.
+- [ ] Multi-node: needs a TCP-capable overlay (tunnel mesh or tailscale); blocked on no vxlan + no inbound UDP.
 
 Contributions welcome. The point of the exercise is to find out how much of the Kubernetes API surface can be made to work here.
 
@@ -190,10 +230,13 @@ Contributions welcome. The point of the exercise is to find out how much of the 
 
 | Path | What |
 |---|---|
-| `container/` | The image: k3s, cloudflared, supervisor entrypoint, status server |
+| `container/` | The image: k3s, litestream, cloudflared, supervisor entrypoint, status server |
+| `container/manifests/` | Vendored coredns and local-path-provisioner, both pointed at the node IP |
+| `svcproxy/` | Userspace ClusterIP Service proxy — the kube-proxy replacement |
 | `probe/probe.sh` | The 24-check kernel probe harness behind the findings |
 | `src/index.ts` | Worker: API passthrough, gated dashboard, `/healthz` |
 | `scripts/deploy.sh` | One command from zero to a working `kubeconfig.yaml` |
+| `scripts/tunnel-setup.sh` | Automates the Cloudflare Tunnel path end to end (needs an API token) |
 | `docs/FINDINGS.md` | The full write-up: probe matrix, every error, exact causes |
 
 ## License

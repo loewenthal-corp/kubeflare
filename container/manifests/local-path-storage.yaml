@@ -1,0 +1,147 @@
+# Dynamic PVC provisioning on the node's disk.
+#
+# This is k3s's own packaged local-path-provisioner (rancher/local-path
+# v0.0.36), vendored for one reason: the stock deployment reaches the
+# apiserver via the kubernetes.default ClusterIP, which this kernel cannot
+# route (docs/FINDINGS.md §5.2), so it CrashLoops forever. The only functional
+# change is the KUBERNETES_SERVICE_HOST/PORT override pointing client-go at
+# the node IP. The packaged copy is disabled with --disable local-storage;
+# patching it live instead would be undone by k3s's addon reconciler on every
+# restart.
+#
+# Volumes land under /var/lib/rancher/k3s/storage on the EPHEMERAL disk: they
+# survive pod restarts, not container restarts. Real durability comes from the
+# R2-backed storage work (see roadmap).
+# __NODE_IP__ is substituted by entrypoint.sh at boot.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: local-path-provisioner-service-account
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: local-path-provisioner-role
+rules:
+  - apiGroups: [""]
+    resources: [nodes, persistentvolumeclaims, configmaps, pods/log]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [endpoints, persistentvolumes, pods]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: local-path-provisioner-bind
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: local-path-provisioner-role
+subjects:
+  - kind: ServiceAccount
+    name: local-path-provisioner-service-account
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-path-config
+  namespace: kube-system
+data:
+  config.json: |-
+    {
+      "nodePathMap":[
+      {
+        "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
+        "paths":["/var/lib/rancher/k3s/storage"]
+      }
+      ]
+    }
+  helperPod.yaml: |-
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+    spec:
+      containers:
+      - name: helper-pod
+        image: "rancher/mirrored-library-busybox:1.37.0"
+        imagePullPolicy: IfNotPresent
+  setup: |-
+    #!/bin/sh
+    set -eu
+    mkdir -m 0777 -p "${VOL_DIR}"
+    chmod 700 "${VOL_DIR}/.."
+  teardown: |-
+    #!/bin/sh
+    set -eu
+    rm -rf "${VOL_DIR}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-path-provisioner
+  namespace: kube-system
+spec:
+  replicas: 1
+  revisionHistoryLimit: 0
+  selector:
+    matchLabels:
+      app: local-path-provisioner
+  template:
+    metadata:
+      labels:
+        app: local-path-provisioner
+    spec:
+      serviceAccountName: local-path-provisioner-service-account
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Exists
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: local-path-provisioner
+          image: rancher/local-path-provisioner:v0.0.36
+          imagePullPolicy: IfNotPresent
+          command: [local-path-provisioner, start, --config, /etc/config/config.json]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Dial the apiserver on the node IP; the ClusterIP default is
+            # unroutable on this kernel.
+            - name: KUBERNETES_SERVICE_HOST
+              value: "__NODE_IP__"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config/
+      volumes:
+        - name: config-volume
+          configMap:
+            name: local-path-config
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+    defaultVolumeType: local
+provisioner: rancher.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer

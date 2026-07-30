@@ -242,6 +242,52 @@ WebSocket variant even with `KUBECTL_REMOTE_COMMAND_WEBSOCKETS=true`.
 `exec` works fine inside the cluster. **The clean fix is the tunnel path (§7), which carries raw TLS to
 6443 and never asks the edge to switch protocols.** Timeboxed and stopped per the spike's own rule.
 
+### 5.x Update, 2026-07-29 — three of these fell
+
+Findings from a follow-up session; the sections above are kept as written for the record.
+
+- **§5.4 was misdiagnosed — the edge was innocent.** kubectl has defaulted to the
+  *WebSocket* transport since 1.31. The WS dial died inside the **Worker**:
+  `containerFetch()` is a JSRPC method, and a Response carrying a WebSocket cannot
+  cross an RPC boundary — `DataCloneError`, surfaced as an opaque 1101. kubectl then
+  silently fell back to SPDY, and *that* is what the edge 400s. Routing `/k8s/*`
+  through the DO fetch boundary (`container.fetch(switchPort(request, 8001))`)
+  fixed `exec`, `attach`, `port-forward`, and `cp` through the plain Worker path.
+  Verified live.
+- **§5.3 solved without kube-proxy:** vendored coredns with `hostNetwork: true`
+  (health/ready moved off :8080, which the status server owns), apiserver reached
+  via `KUBERNETES_SERVICE_HOST=<node IP>`, kubelet pointed at the node IP with
+  `--kubelet-arg=cluster-dns=`. Pods with default dnsPolicy resolve cluster and
+  internet names. Same env-override unbreaks the packaged local-path-provisioner,
+  so PVCs work; both are vendored because k3s's addon reconciler reverts live
+  patches on every start.
+- **§5.2 got worse, then fell.** kube-proxy's nfacct rule turns out to be skippable
+  (`--conntrack-tcp-be-liberal=true`), but a fuller probe of the deployed kernel
+  shows **`xt_statistic` and `xt_recent` are also missing** — so iptables mode dies
+  on any multi-endpoint service regardless. IPVS: `/proc/net/ip_vs` absent. eBPF:
+  no BTF (`/sys/kernel/btf/vmlinux` missing), so CO-RE (Cilium-style) replacements
+  are out. All four kube-proxy dataplanes are unavailable, and no kernel change is
+  possible from inside the container.
+
+  The way out is **Linux AnyIP**, verified on the deployed kernel:
+  `ip route replace local 10.43.0.0/16 dev lo` makes every ClusterIP bindable with
+  a plain `bind()`. `svcproxy/` is a userspace proxy built on that — it watches
+  Services and EndpointSlices, binds each ClusterIP:port, and forwards TCP and UDP
+  to ready endpoints. k3s runs `--disable-kube-proxy`. **Measured on the deployed
+  cluster:** pod → ClusterIP nginx `http 200`, pod → `10.43.0.1:443` serves
+  `/version`, DNS through the `kube-dns` ClusterIP resolves, `http://nginx.default.svc.cluster.local`
+  returns 200, and 6 requests across a 3-replica Service land 2/2/2. Every one of
+  those timed out before. Costs: source IP is the node's (userspace re-origination),
+  no `sessionAffinity: ClientIP`, no NodePort.
+
+  Full probe results (deployed kernel, `iptables -A` per extension):
+  `xt_conntrack`, `xt_addrtype`, `xt_mark`, `MARK`, `MASQUERADE`
+  (incl. `--random-fully`), `DNAT`, `REJECT`, `xt_multiport`, `xt_comment` — **OK**;
+  `xt_nfacct`, `xt_statistic`, `xt_recent`, `/proc/net/ip_vs`,
+  `/sys/kernel/btf/vmlinux`, `/proc/config.gz` — **MISSING**; AnyIP local route +
+  arbitrary ClusterIP bind, `nf_conntrack_tcp_be_liberal` sysctl, dummy interface —
+  **OK**.
+
 ### 5.5 Ephemeral disk is brutal during iteration
 
 Every rollout replaces the instance and wipes the disk — cluster state, the k3s CA, and all logs. In

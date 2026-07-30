@@ -12,3 +12,8 @@ tunnel-kubeconfig.yaml
 .DS_Store
 *.log
 .kubeflare-token
+.kubeflare-k3s-token
+.kubeflare-node-password
+
+# stray go build output
+svcproxy/svcproxy

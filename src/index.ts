@@ -26,6 +26,12 @@ export class KubeFlare extends Container<Env> {
     R2_BUCKET: this.env.R2_BUCKET ?? "",
     K3S_TOKEN: this.env.K3S_TOKEN ?? "",
     K3S_NODE_PASSWORD: this.env.K3S_NODE_PASSWORD ?? "",
+    // R2-backed PersistentVolumes (JuiceFS → the juicefs-r2 StorageClass). Rides
+    // on the credentials and endpoint above; this is just the data bucket, so it
+    // is a plain var. Blank turns the feature off, and it is off anyway unless
+    // durable state is on — the filesystem's metadata is a SQLite DB that only
+    // litestream keeps alive across the ephemeral disk.
+    R2_BUCKET_JFS: this.env.R2_BUCKET_JFS ?? "",
   };
 
   override onStart() {
@@ -50,6 +56,7 @@ interface Env {
   LITESTREAM_SECRET_ACCESS_KEY?: string;
   R2_ENDPOINT?: string;
   R2_BUCKET?: string;
+  R2_BUCKET_JFS?: string;
   K3S_TOKEN?: string;
   K3S_NODE_PASSWORD?: string;
 }
@@ -93,6 +100,24 @@ export default {
     const presented = bearer || url.searchParams.get("token") || "";
     if (!tokensMatch(presented, guard)) {
       return new Response("forbidden\n", { status: 403 });
+    }
+
+    // Restart the container instance. Needed because envVars are read once, at
+    // container start: changing a Worker secret (R2 credentials, tunnel token)
+    // does NOT reach a running container, and a secret-only change does not
+    // alter the image, so `wrangler deploy` triggers no container rollout
+    // either. This is the supported way to pick up new secrets.
+    //
+    // Destroys the cluster unless durable state is on, so it is POST-only.
+    if (url.pathname === "/admin/restart") {
+      if (request.method !== "POST") {
+        return new Response("POST required — this restarts the cluster\n", { status: 405 });
+      }
+      await container.destroy();
+      return new Response(
+        "container destroyed; it restarts on the next request (~90s to a ready cluster)\n",
+        { headers: { "content-type": "text/plain" } },
+      );
     }
 
     // Kubernetes API passthrough. kubectl points at <worker>/k8s and

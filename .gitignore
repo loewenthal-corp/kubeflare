@@ -3,6 +3,8 @@ node_modules/
 .dev.vars
 
 # Credentials — kubeconfig.yaml embeds a cluster-admin token
+.env
+.env.*
 kubeconfig.yaml
 tunnel-kubeconfig.yaml
 *.token

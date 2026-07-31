@@ -93,7 +93,7 @@ Every entry below is a kernel gap, and the kernel takes no modules: there is no 
 |---|---|
 | kube-proxy, all four backends | this kernel is missing something for each one (below) — worked around in userspace, see `svcproxy/` |
 | **NetworkPolicy — silently does nothing** | kube-router emits `-j NFLOG` per pod chain and the kernel has no `xt_NFLOG`, so its transactional `iptables-restore` discards the *entire* ruleset. Policies are accepted and never enforced, ingress **and** egress |
-| `type: LoadBalancer` status | no cloud LB controller, so `.status.loadBalancer.ingress` stays empty. The allocated nodePort still works (below) |
+| Raw-TCP LoadBalancer Services | `lbcontroller` writes `http://` origins, so a non-HTTP Service needs a different tunnel ingress scheme |
 | Source IP preservation | svcproxy re-originates connections, so backends see the node address |
 | `sessionAffinity: ClientIP` | not implemented by svcproxy (ignored with a warning) |
 | Service ports 8001 / 8080 | the host binds these on `0.0.0.0` (kubectl proxy, status server), so svcproxy cannot bind a ClusterIP on them. Pick another port |
@@ -433,7 +433,7 @@ Roughly in order of value:
 - [ ] Bind `kubectl proxy` and the status server to the node IP instead of `0.0.0.0`, so the pod→host firewall guards become belt-and-braces rather than the only defence — and so Services can use ports 8001/8080.
 - [x] NodePort Services, reachable from the internet through the Worker.
 - [ ] Source-IP preservation and `sessionAffinity: ClientIP` in svcproxy.
-- [ ] `type: LoadBalancer` status: a controller that provisions a Cloudflare Tunnel public hostname per Service and writes it into `.status.loadBalancer.ingress`.
+- [x] `type: LoadBalancer` — `lbcontroller/` provisions a Cloudflare Tunnel hostname + DNS record per Service and publishes it in `.status.loadBalancer.ingress`.
 - [x] R2-backed PersistentVolumes: JuiceFS (host mount, SQLite metadata on the same litestream pipeline) + a `juicefs-r2` StorageClass.
 - [ ] R2-backed image cache: `registry:3` pull-through proxy on the s3 driver, `registries.yaml` mirror — cold boots stop re-pulling from Docker Hub.
 - [ ] WARP private networking: route `10.42.0.0/15` through the tunnel so an enrolled laptop reaches pod/service IPs directly.

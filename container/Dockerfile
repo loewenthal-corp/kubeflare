@@ -107,5 +107,10 @@ COPY container/manifests/ /manifests/
 COPY container/manifests-optional/ /manifests-optional/
 RUN chmod +x /entrypoint.sh
 
+# Bumped to force a new image digest when only config changed, so Cloudflare
+# actually rolls a fresh instance instead of reusing the old one.
+ARG KUBEFLARE_REBUILD=2
+RUN echo "rebuild=$KUBEFLARE_REBUILD" > /etc/kubeflare-build
+
 EXPOSE 8080
 CMD ["/entrypoint.sh"]

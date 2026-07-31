@@ -500,6 +500,7 @@ if [ -n "${CLOUDFLARE_TUNNEL_API_TOKEN:-}" ] && [ -n "${CF_ACCOUNT_ID:-}" ] \
             --zone-id "$CF_ZONE_ID" \
             --tunnel-id "$CF_TUNNEL_ID" \
             ${LB_HOSTNAME_SUFFIX:+--hostname-suffix "$LB_HOSTNAME_SUFFIX"} \
+            ${TUNNEL_HOSTNAME:+--protect-hostname "$TUNNEL_HOSTNAME"} \
             >>"$LOG_DIR/lbcontroller.log" 2>&1
           log "lbcontroller exited (see lbcontroller.log); restarting in 10s"
           sleep 10

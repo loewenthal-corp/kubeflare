@@ -42,7 +42,7 @@ func TestRebuildIngressPreservesTheAPIServerRule(t *testing.T) {
 	}
 	desired := []ingressRule{managed("web-default."+testSuffix, "http://10.43.0.7:80")}
 
-	got, conflicts := rebuildIngress(existing, desired, nil, testSuffix)
+	got, conflicts := rebuildIngress(existing, desired, nil, testSuffix, nil)
 	want := []string{
 		"k8s.kubeflare.dev=>tcp://localhost:6443",
 		"web-default.lb.kubeflare.dev=>http://10.43.0.7:80",
@@ -61,7 +61,7 @@ func TestRebuildIngressKeepsTheCatchAllLastAndVerbatim(t *testing.T) {
 	existing := []ingressRule{apiserverRule(), custom}
 	desired := []ingressRule{managed("web-default."+testSuffix, "http://10.43.0.7:80")}
 
-	got, _ := rebuildIngress(existing, desired, nil, testSuffix)
+	got, _ := rebuildIngress(existing, desired, nil, testSuffix, nil)
 	last := got[len(got)-1]
 	if !last.isCatchAll() || last.service() != "http_status:503" {
 		t.Errorf("last rule = %v, want the pre-existing 503 catch-all", last)
@@ -76,7 +76,7 @@ func TestRebuildIngressKeepsTheCatchAllLastAndVerbatim(t *testing.T) {
 func TestRebuildIngressSynthesisesAMissingCatchAll(t *testing.T) {
 	// An ingress list whose final entry still matches on hostname is rejected
 	// by the API, so one has to be appended even when the old document had none.
-	got, _ := rebuildIngress([]ingressRule{apiserverRule()}, nil, nil, testSuffix)
+	got, _ := rebuildIngress([]ingressRule{apiserverRule()}, nil, nil, testSuffix, nil)
 	want := []string{"k8s.kubeflare.dev=>tcp://localhost:6443", "=>http_status:404"}
 	if !slices.Equal(summary(got), want) {
 		t.Errorf("rebuildIngress = %v, want %v", summary(got), want)
@@ -84,7 +84,7 @@ func TestRebuildIngressSynthesisesAMissingCatchAll(t *testing.T) {
 }
 
 func TestRebuildIngressEmptyConfig(t *testing.T) {
-	got, _ := rebuildIngress(nil, nil, nil, testSuffix)
+	got, _ := rebuildIngress(nil, nil, nil, testSuffix, nil)
 	if want := []string{"=>http_status:404"}; !slices.Equal(summary(got), want) {
 		t.Errorf("rebuildIngress = %v, want %v", summary(got), want)
 	}
@@ -97,7 +97,7 @@ func TestRebuildIngressIsDeterministicAndIdempotent(t *testing.T) {
 		managed("api-prod."+testSuffix, "http://10.43.0.1:80"),
 		managed("api-dev."+testSuffix, "http://10.43.0.2:80"),
 	}
-	first, _ := rebuildIngress(existing, desired, nil, testSuffix)
+	first, _ := rebuildIngress(existing, desired, nil, testSuffix, nil)
 	want := []string{
 		"k8s.kubeflare.dev=>tcp://localhost:6443",
 		"api-dev.lb.kubeflare.dev=>http://10.43.0.2:80",
@@ -112,7 +112,7 @@ func TestRebuildIngressIsDeterministicAndIdempotent(t *testing.T) {
 	// feeding the result back in must be a no-op — that is what stops the
 	// controller from PUTting on every pass.
 	shuffled := []ingressRule{desired[1], desired[2], desired[0]}
-	again, _ := rebuildIngress(first, shuffled, nil, testSuffix)
+	again, _ := rebuildIngress(first, shuffled, nil, testSuffix, nil)
 	if !rulesEqual(first, again) {
 		t.Errorf("not idempotent:\n first = %v\n again = %v", summary(first), summary(again))
 	}
@@ -124,7 +124,7 @@ func TestRebuildIngressRefusesToStealAForeignHostname(t *testing.T) {
 	existing := []ingressRule{apiserverRule(), catchAllRule()}
 	desired := []ingressRule{managed("k8s.kubeflare.dev", "http://10.43.0.7:80")}
 
-	got, conflicts := rebuildIngress(existing, desired, nil, testSuffix)
+	got, conflicts := rebuildIngress(existing, desired, nil, testSuffix, nil)
 	if !rulesEqual(got, existing) {
 		t.Errorf("rebuildIngress = %v, want the document unchanged", summary(got))
 	}
@@ -140,7 +140,7 @@ func TestRebuildIngressAdoptsARuleThatIsAlreadyExactlyRight(t *testing.T) {
 	mine := managed("shop.kubeflare.dev", "http://10.43.0.7:80")
 	existing := []ingressRule{apiserverRule(), mine, catchAllRule()}
 
-	got, conflicts := rebuildIngress(existing, []ingressRule{managed("shop.kubeflare.dev", "http://10.43.0.7:80")}, nil, testSuffix)
+	got, conflicts := rebuildIngress(existing, []ingressRule{managed("shop.kubeflare.dev", "http://10.43.0.7:80")}, nil, testSuffix, nil)
 	if len(conflicts) != 0 {
 		t.Errorf("conflicts = %v, want none for an identical rule", conflicts)
 	}
@@ -148,7 +148,7 @@ func TestRebuildIngressAdoptsARuleThatIsAlreadyExactlyRight(t *testing.T) {
 		t.Errorf("rebuildIngress = %v, want the document unchanged", summary(got))
 	}
 	// The same hostname pointing somewhere else is a different matter.
-	_, conflicts = rebuildIngress(existing, []ingressRule{managed("shop.kubeflare.dev", "http://10.43.0.9:80")}, nil, testSuffix)
+	_, conflicts = rebuildIngress(existing, []ingressRule{managed("shop.kubeflare.dev", "http://10.43.0.9:80")}, nil, testSuffix, nil)
 	if len(conflicts) != 1 {
 		t.Errorf("conflicts = %v, want one for a rule that would change", conflicts)
 	}
@@ -160,11 +160,11 @@ func TestRebuildIngressReapsOwnedHostnamesOutsideTheSuffix(t *testing.T) {
 	stale := managed("shop.kubeflare.dev", "http://10.43.0.4:80")
 	existing := []ingressRule{apiserverRule(), stale, catchAllRule()}
 
-	kept, _ := rebuildIngress(existing, nil, nil, testSuffix)
+	kept, _ := rebuildIngress(existing, nil, nil, testSuffix, nil)
 	if !slices.Contains(summary(kept), "shop.kubeflare.dev=>http://10.43.0.4:80") {
 		t.Errorf("an unrecognised rule was dropped: %v", summary(kept))
 	}
-	reaped, _ := rebuildIngress(existing, nil, map[string]bool{"shop.kubeflare.dev": true}, testSuffix)
+	reaped, _ := rebuildIngress(existing, nil, map[string]bool{"shop.kubeflare.dev": true}, testSuffix, nil)
 	if slices.Contains(summary(reaped), "shop.kubeflare.dev=>http://10.43.0.4:80") {
 		t.Errorf("an owned rule survived: %v", summary(reaped))
 	}
@@ -178,7 +178,7 @@ func TestRebuildIngressPreservesFieldsItDoesNotUnderstand(t *testing.T) {
 		"originRequest": map[string]any{"noTLSVerify": true, "connectTimeout": json.Number("30")},
 	}
 	existing := []ingressRule{foreign, catchAllRule()}
-	got, _ := rebuildIngress(existing, []ingressRule{managed("web-default."+testSuffix, "http://10.43.0.7:80")}, nil, testSuffix)
+	got, _ := rebuildIngress(existing, []ingressRule{managed("web-default."+testSuffix, "http://10.43.0.7:80")}, nil, testSuffix, nil)
 
 	before, _ := json.Marshal(foreign)
 	after, _ := json.Marshal(got[0])
@@ -191,7 +191,7 @@ func TestRebuildIngressReportsAShadowingRule(t *testing.T) {
 	// A rule with no hostname that is not last matches everything, so nothing
 	// this controller appends would ever be reached.
 	existing := []ingressRule{{"service": "http://10.0.0.9:80"}, apiserverRule(), catchAllRule()}
-	got, conflicts := rebuildIngress(existing, []ingressRule{managed("web-default."+testSuffix, "http://10.43.0.7:80")}, nil, testSuffix)
+	got, conflicts := rebuildIngress(existing, []ingressRule{managed("web-default."+testSuffix, "http://10.43.0.7:80")}, nil, testSuffix, nil)
 	if len(conflicts) != 1 || conflicts[0].hostname != "" || !strings.Contains(conflicts[0].reason, "shadow") {
 		t.Fatalf("conflicts = %v, want one shadowing warning", conflicts)
 	}
@@ -392,5 +392,44 @@ func TestDecideDNS(t *testing.T) {
 				t.Errorf("decideDNS = (%v, %q), want (%v, %q)", verb, id, tc.wantVerb, tc.wantID)
 			}
 		})
+	}
+}
+
+// Regression: with --hostname-suffix set to the zone apex, every hostname in
+// the zone matches the suffix — including the apiserver's tunnel rule. Before
+// protected hostnames existed this silently deleted it on the first pass
+// (observed live: rules=2 managed=1 preserved=0). The apex suffix is not a
+// misconfiguration to reject: Universal SSL only covers one label deep, so it
+// is the only suffix that gets working TLS without Advanced Certificate Manager.
+func TestApexSuffixStillPreservesAProtectedHostname(t *testing.T) {
+	const apex = "kubeflare.dev"
+	protected := map[string]bool{"k8s.kubeflare.dev": true}
+	existing := []ingressRule{apiserverRule()}
+	desired := []ingressRule{managed("shop-default.kubeflare.dev", "http://10.43.0.7:80")}
+
+	got, conflicts := rebuildIngress(existing, desired, nil, apex, protected)
+	if len(conflicts) != 0 {
+		t.Fatalf("unexpected conflicts: %v", conflicts)
+	}
+	var sawAPI, sawShop bool
+	for _, r := range got {
+		switch r.hostname() {
+		case "k8s.kubeflare.dev":
+			sawAPI = true
+			if svc := r.service(); svc != "tcp://localhost:6443" {
+				t.Errorf("apiserver rule was rewritten: service=%q", svc)
+			}
+		case "shop-default.kubeflare.dev":
+			sawShop = true
+		}
+	}
+	if !sawAPI {
+		t.Error("apiserver rule was dropped under an apex suffix — the live regression")
+	}
+	if !sawShop {
+		t.Error("managed rule missing")
+	}
+	if last := got[len(got)-1]; last.hostname() != "" {
+		t.Errorf("catch-all is not last: %v", last)
 	}
 }

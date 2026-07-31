@@ -82,8 +82,21 @@ type conflict struct {
 // of Services whose hostname annotation just changed, and of hostnames left
 // behind by a forced finalizer release, none of which can be recognised from
 // the suffix when the annotation put them somewhere else in the zone.
-func isManagedHostname(h, suffix string, owned map[string]bool) bool {
+// protected hostnames are never managed, whatever the suffix says. This exists
+// because --hostname-suffix is legitimately set to the zone apex (Cloudflare's
+// Universal SSL covers example.com and *.example.com but NOT *.lb.example.com,
+// so a nested suffix means no working TLS without Advanced Certificate
+// Manager). At the apex, "under the suffix" matches every hostname in the zone
+// — including the apiserver's own tunnel rule, which this controller then
+// cheerfully deleted. Measured, on a live tunnel: rules=2 managed=1
+// preserved=0, and the k8s.* rule was gone.
+func isManagedHostname(h, suffix string, owned map[string]bool, protected map[string]bool) bool {
 	if h == "" {
+		return false
+	}
+	// Protection beats everything, including owned: if a hostname is declared
+	// off-limits, no amount of controller state should let it be rewritten.
+	if protected[h] {
 		return false
 	}
 	if owned[h] {
@@ -110,7 +123,7 @@ func isManagedHostname(h, suffix string, owned map[string]bool) bool {
 // A desired hostname that collides with a preserved rule is dropped and
 // reported: refusing to publish one Service is much better than evicting the
 // rule that carries kubectl traffic.
-func rebuildIngress(existing, desired []ingressRule, owned map[string]bool, suffix string) ([]ingressRule, []conflict) {
+func rebuildIngress(existing, desired []ingressRule, owned map[string]bool, suffix string, protected map[string]bool) ([]ingressRule, []conflict) {
 	var conflicts []conflict
 
 	body := existing
@@ -133,7 +146,7 @@ func rebuildIngress(existing, desired []ingressRule, owned map[string]bool, suff
 		h := r.hostname()
 		// Ours: it is rebuilt from the desired set below, or it belonged to a
 		// Service that has gone away and this is where it gets reaped.
-		if isManagedHostname(h, suffix, owned) {
+		if isManagedHostname(h, suffix, owned, protected) {
 			continue
 		}
 		// Not recognisably ours, but identical to what would be written for it

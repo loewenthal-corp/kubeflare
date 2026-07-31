@@ -53,7 +53,9 @@ type controller struct {
 	synced []cache.InformerSynced
 	log    *slog.Logger
 
-	suffix       string
+	suffix string
+	// hostnames this controller must never touch, whatever the suffix implies
+	protected    map[string]bool
 	tunnelTarget string // <tunnel-id>.cfargotunnel.com
 	dryRun       bool
 
@@ -82,7 +84,7 @@ type controller struct {
 }
 
 func newController(factory informers.SharedInformerFactory, client kubernetes.Interface, cf cfAPI,
-	suffix, tunnelID string, dryRun bool, log *slog.Logger) (*controller, error) {
+	suffix, tunnelID string, protected map[string]bool, dryRun bool, log *slog.Logger) (*controller, error) {
 	svcInf := factory.Core().V1().Services()
 	c := &controller{
 		svcs:          svcInf.Lister(),
@@ -90,6 +92,7 @@ func newController(factory informers.SharedInformerFactory, client kubernetes.In
 		cf:            cf,
 		log:           log,
 		suffix:        suffix,
+		protected:     protected,
 		tunnelTarget:  tunnelID + ".cfargotunnel.com",
 		dryRun:        dryRun,
 		kick:          make(chan struct{}, 1),
@@ -333,7 +336,7 @@ func (c *controller) reconcileIngress(ctx context.Context, live, cleanup []lbTar
 	}
 
 	current := cfg.ingress()
-	rules, conflicts := rebuildIngress(current, desired, c.owned, c.suffix)
+	rules, conflicts := rebuildIngress(current, desired, c.owned, c.suffix, c.protected)
 	conflicted := make(map[string]bool, len(conflicts))
 	for _, cf := range conflicts {
 		if cf.hostname != "" {

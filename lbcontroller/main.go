@@ -44,6 +44,7 @@ type options struct {
 	zoneID     string
 	tunnelID   string
 	suffix     string
+	protect    string
 	dryRun     bool
 	token      string
 }
@@ -55,6 +56,10 @@ func main() {
 	flag.StringVar(&o.zoneID, "zone-id", "", "Cloudflare zone ID the hostnames live in (required)")
 	flag.StringVar(&o.tunnelID, "tunnel-id", "", "Cloudflare Tunnel ID to publish ingress rules on (required)")
 	flag.StringVar(&o.suffix, "hostname-suffix", "lb.kubeflare.dev", "suffix for derived hostnames, <service>-<namespace>.<suffix>")
+	// Required whenever --hostname-suffix is the zone apex, because then every
+	// hostname in the zone looks like ours — including the apiserver's tunnel
+	// rule, which we would otherwise delete on the first pass.
+	flag.StringVar(&o.protect, "protect-hostname", "", "comma-separated hostnames this controller must never manage (e.g. the apiserver's tunnel hostname)")
 	flag.BoolVar(&o.dryRun, "dry-run", false, "compute and log everything, change nothing in Cloudflare or the cluster")
 	verbose := flag.Bool("v", false, "verbose (debug) logging")
 	flag.Parse()
@@ -123,7 +128,16 @@ func run(o options, log *slog.Logger) error {
 
 	cf := newCFClient(defaultAPIBase, o.token, o.accountID, o.zoneID, o.tunnelID, o.dryRun, log)
 	factory := informers.NewSharedInformerFactory(client, resyncPeriod)
-	ctrl, err := newController(factory, client, cf, o.suffix, o.tunnelID, o.dryRun, log)
+	protected := map[string]bool{}
+	for _, h := range strings.Split(o.protect, ",") {
+		if h = strings.ToLower(strings.Trim(strings.TrimSpace(h), ".")); h != "" {
+			protected[h] = true
+		}
+	}
+	if len(protected) > 0 {
+		log.Info("hostnames protected from management", "hostnames", o.protect)
+	}
+	ctrl, err := newController(factory, client, cf, o.suffix, o.tunnelID, protected, o.dryRun, log)
 	if err != nil {
 		return err
 	}

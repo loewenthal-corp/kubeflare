@@ -45,7 +45,12 @@
     "CF_ACCOUNT_ID": "efa2c77d00fdfef6fa9c3678716d3160",
     "CF_ZONE_ID": "2b46f0e6cf1112ffeaa84cf9179ed28c",
     "CF_TUNNEL_ID": "6b0094c3-200b-4f19-b5e1-bc438f31c811",
-    "LB_HOSTNAME_SUFFIX": "lb.kubeflare.dev"
+    // Deliberately a single label under the zone apex, NOT "lb.kubeflare.dev".
+    // Cloudflare's Universal SSL covers kubeflare.dev and *.kubeflare.dev but
+    // not *.lb.kubeflare.dev — a second-level wildcard needs Advanced
+    // Certificate Manager. Measured: with the deeper suffix the tunnel served
+    // plain HTTP 200 while HTTPS died in the TLS handshake.
+    "LB_HOSTNAME_SUFFIX": "kubeflare.dev"
   },
 
   "containers": [

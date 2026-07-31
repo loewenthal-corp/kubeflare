@@ -22,3 +22,6 @@ svcproxy/svcproxy
 
 # image-cache registry credentials
 .kubeflare-registry-creds
+
+# tunnel id (not secret, but environment-specific)
+.kubeflare-tunnel-id

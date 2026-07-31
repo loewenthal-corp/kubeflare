@@ -181,6 +181,16 @@ export default {
     // untouched, which `kubectl proxy --api-prefix=/k8s/` relies on.
     if (url.pathname === "/k8s" || url.pathname.startsWith("/k8s/")) {
       try {
+        // Do NOT rebuild this Request. Rebuilding drops the connection-upgrade
+        // semantics exec/attach/port-forward need — measured: kubectl exec
+        // started returning HTML the moment this became
+        // `new Request(request.url, request)`. The /np route can rebuild
+        // because it only ever carries ordinary HTTP.
+        //
+        // If every API call suddenly returns the status dashboard, the cause is
+        // NOT here: it is `kubectl proxy` having wedged inside the container, at
+        // which point the DO falls back to defaultPort (8080). The entrypoint
+        // now health-checks and restarts it.
         return await container.fetch(switchPort(request, KUBE_PROXY_PORT));
       } catch (err) {
         // Surface real errors instead of an opaque Cloudflare 1101 page.

@@ -21,12 +21,25 @@ fi
 
 ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
 if [ -z "$ACCOUNT_ID" ]; then
-  ACCOUNT_ID=$(curl -sS -H "Authorization: Bearer $TOKEN" \
-    "https://api.cloudflare.com/client/v4/accounts" \
-    | sed -n 's/.*"id":"\([0-9a-f]\{32\}\)".*/\1/p' | head -1)
+  # Retry: a single transient failure here used to abort the whole deploy before
+  # anything was built, which is a bad trade for a check that only exists to
+  # produce a nicer error message.
+  for attempt in 1 2 3; do
+    ACCOUNT_ID=$(curl -sS --max-time 20 -H "Authorization: Bearer $TOKEN" \
+      "https://api.cloudflare.com/client/v4/accounts" 2>/dev/null \
+      | sed -n 's/.*"id":"\([0-9a-f]\{32\}\)".*/\1/p' | head -1)
+    [ -n "$ACCOUNT_ID" ] && break
+    sleep $((attempt * 2))
+  done
 fi
-[ -n "$ACCOUNT_ID" ] || {
-  echo "  could not determine the account. Set CLOUDFLARE_ACCOUNT_ID." >&2; exit 1; }
+if [ -z "$ACCOUNT_ID" ]; then
+  # Warn rather than fail. This script is an early-warning convenience; refusing
+  # to deploy because we could not *check* entitlement is worse than letting
+  # wrangler try and report for itself.
+  echo "  WARNING: could not determine the account (transient API failure?)." >&2
+  echo "  Skipping the entitlement check; set CLOUDFLARE_ACCOUNT_ID to silence this." >&2
+  exit 0
+fi
 
 body=$(curl -sS -H "Authorization: Bearer $TOKEN" \
   "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/containers/me")

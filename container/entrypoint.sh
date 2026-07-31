@@ -427,7 +427,10 @@ start_k3s
 # re-exposes the same API over HTTP, using the node's own admin credentials — so
 # the Worker becomes a usable kubectl endpoint without any tunnel at all.
 # Access is gated by a shared secret the Worker checks; see src/index.ts.
-KPROXY_PID=""
+# The PID goes to a file, not a variable: start_kproxy is launched with `&`, so
+# it runs in a subshell and any variable it sets is lost to the supervisor that
+# needs to watch it.
+KPROXY_PIDFILE=/run/kubeflare-kproxy.pid
 start_kproxy() {
   for _ in $(seq 1 120); do
     if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then
@@ -441,8 +444,8 @@ start_kproxy() {
         --accept-hosts='.*' --accept-paths='.*' --reject-paths='' \
         --api-prefix=/k8s/ \
         >>"$LOG_DIR/kubectl-proxy.log" 2>&1 &
-      KPROXY_PID=$!
-      log "kubectl proxy pid=$KPROXY_PID on :8001"
+      echo $! > "$KPROXY_PIDFILE"
+      log "kubectl proxy pid=$(cat "$KPROXY_PIDFILE") on :8001"
       return
     fi
     sleep 5
@@ -567,6 +570,39 @@ while true; do
   # and a k3s restart or any CNI teardown can take the chain with it; an
   # idempotent -C/-I costs nothing and losing them means losing cluster-admin.
   harden_local_ports
+
+  # Supervise kubectl proxy. This is the single most load-bearing process for
+  # remote access — every kubectl call goes through it — and it was previously
+  # the only long-running child nothing watched. A wedged proxy is worse than a
+  # dead one: the Durable Object falls back to defaultPort, so the API starts
+  # answering with the status dashboard and kubectl fails on `invalid character
+  # '<'` with no clue as to why. Seen in production; this is the fix.
+  #
+  # Liveness is a real request, not `kill -0`: the failure mode observed was a
+  # process still alive but no longer serving. Only restart once the apiserver
+  # itself is up, or a slow k3s boot would look like a wedged proxy.
+  KPROXY_PID=$(cat "$KPROXY_PIDFILE" 2>/dev/null)
+  if [ -n "$KPROXY_PID" ]; then
+    if ! kill -0 "$KPROXY_PID" 2>/dev/null; then
+      log "kubectl proxy exited; restarting"
+      rm -f "$KPROXY_PIDFILE"; KPROXY_BAD=0
+      start_kproxy &
+    elif ! curl -fsS -m 5 -o /dev/null "http://127.0.0.1:8001/k8s/version" 2>/dev/null; then
+      KPROXY_BAD=$((${KPROXY_BAD:-0} + 1))
+      # Three consecutive misses (~30s) before acting, and only once the
+      # apiserver itself answers, so a slow boot or a brief blip does not send
+      # this into a restart loop.
+      if [ "$KPROXY_BAD" -ge 3 ] && /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then
+        log "kubectl proxy alive but not serving; restarting it"
+        kill "$KPROXY_PID" 2>/dev/null
+        rm -f "$KPROXY_PIDFILE"; KPROXY_BAD=0
+        start_kproxy &
+      fi
+    else
+      KPROXY_BAD=0
+    fi
+  fi
+
   if ! kill -0 "$K3S_PID" 2>/dev/null; then
     log "k3s exited (see k3s.log); restarting in 10s"
     sleep 10

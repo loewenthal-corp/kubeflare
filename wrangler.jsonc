@@ -20,7 +20,9 @@
     "KUBE_PROXY_MODE": "nftables",
     // Only needed if you wire up a Cloudflare Tunnel (docs/TUNNEL.md). It is
     // added to the apiserver certificate's SANs.
-    "TUNNEL_HOSTNAME": "",
+    // Added to the apiserver certificate's SANs so the tunnel path
+    // (cloudflared -> tcp://localhost:6443) presents a valid cert.
+    "TUNNEL_HOSTNAME": "k8s.kubeflare.dev",
     // R2 bucket for durable cluster state (litestream). The bucket name is not
     // sensitive; the endpoint (it embeds your account id) and credentials are
     // Worker secrets — deploy.sh prints instructions.

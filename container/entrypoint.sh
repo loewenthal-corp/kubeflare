@@ -478,6 +478,41 @@ start_kproxy &
   log "svcproxy not started: apiserver never ready"
 ) &
 
+# ---------------------------------------------------------------- lbcontroller
+# type: LoadBalancer, implemented by giving each Service a Cloudflare Tunnel
+# public hostname. Needs the tunnel to actually be up (cloudflared, below) and
+# an API token with BOTH Account>Cloudflare Tunnel and Zone>DNS:Edit.
+#
+# All-or-nothing, like every other optional feature here: without the token and
+# both ids it simply does not start, and Services stay <pending> exactly as they
+# do on a cluster with no cloud controller. Self-restarting, and it never exits
+# on a Cloudflare error — a refused API call is one logged line per pass.
+if [ -n "${CLOUDFLARE_TUNNEL_API_TOKEN:-}" ] && [ -n "${CF_ACCOUNT_ID:-}" ] \
+   && [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_TUNNEL_ID:-}" ]; then
+  (
+    for _ in $(seq 1 120); do
+      if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then
+        log "starting lbcontroller (suffix=${LB_HOSTNAME_SUFFIX:-lb.kubeflare.dev})"
+        while true; do
+          /usr/local/bin/kubeflare-lbcontroller \
+            --kubeconfig /etc/rancher/k3s/k3s.yaml \
+            --account-id "$CF_ACCOUNT_ID" \
+            --zone-id "$CF_ZONE_ID" \
+            --tunnel-id "$CF_TUNNEL_ID" \
+            ${LB_HOSTNAME_SUFFIX:+--hostname-suffix "$LB_HOSTNAME_SUFFIX"} \
+            >>"$LOG_DIR/lbcontroller.log" 2>&1
+          log "lbcontroller exited (see lbcontroller.log); restarting in 10s"
+          sleep 10
+        done
+      fi
+      sleep 5
+    done
+    log "lbcontroller not started: apiserver never ready"
+  ) &
+else
+  log "no Cloudflare tunnel/zone config, type: LoadBalancer stays <pending>"
+fi
+
 # ---------------------------------------------------------------- cloudflared
 CFD_PID=""
 start_cloudflared() {

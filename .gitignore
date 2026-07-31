@@ -25,3 +25,6 @@ svcproxy/svcproxy
 
 # tunnel id (not secret, but environment-specific)
 .kubeflare-tunnel-id
+
+# stray go build output
+lbcontroller/lbcontroller

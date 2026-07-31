@@ -16,6 +16,14 @@ WORKDIR /src
 COPY svcproxy/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/kubeflare-svcproxy .
 
+# lbcontroller: implements type: LoadBalancer by provisioning Cloudflare Tunnel
+# public hostnames. Separate from svcproxy on purpose — this one needs a
+# Cloudflare API token, and the dataplane should not.
+FROM golang:1.26 AS lbcontroller-build
+WORKDIR /src
+COPY lbcontroller/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/kubeflare-lbcontroller .
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -87,6 +95,7 @@ RUN set -eux; \
     rm /tmp/juicefs.tar.gz; \
     /usr/local/bin/juicefs version
 
+COPY --from=lbcontroller-build /out/kubeflare-lbcontroller /usr/local/bin/kubeflare-lbcontroller
 COPY --from=svcproxy-build /out/kubeflare-svcproxy /usr/local/bin/kubeflare-svcproxy
 COPY container/entrypoint.sh /entrypoint.sh
 COPY container/status-server.py /status-server.py

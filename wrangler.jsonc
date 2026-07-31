@@ -38,7 +38,14 @@
     // it, and always keeps the real upstream as a fallback, so a broken mirror
     // makes pulls slow rather than impossible. Set to "" to pull from Docker Hub
     // directly. The read-only credentials are Worker secrets.
-    "REGISTRY_MIRROR_URL": "https://kubeflare-registry.the-loewenthal-corporation.workers.dev"
+    "REGISTRY_MIRROR_URL": "https://kubeflare-registry.the-loewenthal-corporation.workers.dev",
+    // type: LoadBalancer via Cloudflare Tunnel hostnames. Ids are not secrets;
+    // the API token is (CLOUDFLARE_TUNNEL_API_TOKEN, a Worker secret). Clear any
+    // of these to leave LoadBalancer Services <pending>.
+    "CF_ACCOUNT_ID": "efa2c77d00fdfef6fa9c3678716d3160",
+    "CF_ZONE_ID": "2b46f0e6cf1112ffeaa84cf9179ed28c",
+    "CF_TUNNEL_ID": "6b0094c3-200b-4f19-b5e1-bc438f31c811",
+    "LB_HOSTNAME_SUFFIX": "lb.kubeflare.dev"
   },
 
   "containers": [

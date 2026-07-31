@@ -31,6 +31,13 @@ export class KubeFlare extends Container<Env> {
     REGISTRY_MIRROR_URL: this.env.REGISTRY_MIRROR_URL ?? "",
     REGISTRY_MIRROR_USERNAME: this.env.REGISTRY_MIRROR_USERNAME ?? "",
     REGISTRY_MIRROR_PASSWORD: this.env.REGISTRY_MIRROR_PASSWORD ?? "",
+    // type: LoadBalancer via Cloudflare Tunnel hostnames. All-or-nothing: the
+    // entrypoint starts lbcontroller only when the token and both ids are set.
+    CLOUDFLARE_TUNNEL_API_TOKEN: this.env.CLOUDFLARE_TUNNEL_API_TOKEN ?? "",
+    CF_ACCOUNT_ID: this.env.CF_ACCOUNT_ID ?? "",
+    CF_ZONE_ID: this.env.CF_ZONE_ID ?? "",
+    CF_TUNNEL_ID: this.env.CF_TUNNEL_ID ?? "",
+    LB_HOSTNAME_SUFFIX: this.env.LB_HOSTNAME_SUFFIX ?? "",
     // R2-backed PersistentVolumes (JuiceFS → the juicefs-r2 StorageClass). Rides
     // on the credentials and endpoint above; this is just the data bucket, so it
     // is a plain var. Blank turns the feature off, and it is off anyway unless
@@ -67,6 +74,11 @@ interface Env {
   REGISTRY_MIRROR_URL?: string;
   REGISTRY_MIRROR_USERNAME?: string;
   REGISTRY_MIRROR_PASSWORD?: string;
+  CLOUDFLARE_TUNNEL_API_TOKEN?: string;
+  CF_ACCOUNT_ID?: string;
+  CF_ZONE_ID?: string;
+  CF_TUNNEL_ID?: string;
+  LB_HOSTNAME_SUFFIX?: string;
 }
 
 const INSTANCE = "main";

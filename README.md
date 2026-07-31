@@ -19,6 +19,28 @@ demo-6f8d4c9b7d-rc66l   1/1     Running   10.42.0.4    cf-cloudchamber
 
 One node, three nginx pods with addresses on a flannel bridge, images pulled from Docker Hub. The same k3s you'd install on a cheap VPS, except there is no VPS. The whole thing lives in a Cloudflare Container that spins up on demand.
 
+## How much of Kubernetes actually works
+
+Measured against the live cluster by [`conformance/run.sh`](conformance/), not inferred
+from the architecture. Full table with evidence and root causes in
+[docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+
+| Status | Count | |
+|---|---|---|
+| **WORKS** | 153 | behaves as stock Kubernetes |
+| WORKS-WITH-CAVEATS | 9 | works, documented difference |
+| **BROKEN** | 14 | root cause known for every one |
+| N/A on one node | 4 | structurally impossible |
+| UNTESTED | 15 | honestly not established |
+
+Everything broken traces to exactly three causes: **no inbound TCP** (the platform
+accepts none), **missing netfilter features** in the guest kernel, and **one node**.
+Nothing broken is mysterious.
+
+Workloads, Services, DNS, storage, RBAC, CRDs, admission webhooks, the scheduler,
+probes, sidecars, ephemeral containers, HPA, and the whole kubectl surface work.
+Crossplane installs and reconciles. The honest gaps are listed below.
+
 ## Why this works at all
 
 Cloudflare Containers have a reputation as locked-down sandboxes: rootless, unprivileged, no netfilter, no cgroup control. Kubernetes is about the worst tenant you could pick for a place like that. The kubelet wants to carve up cgroups, containerd wants to mount overlayfs, kube-proxy wants to rewrite the firewall. If the reputation were accurate, this project would be dead on arrival.
@@ -419,28 +441,33 @@ pulls slow rather than impossible.
 
 ## Roadmap
 
-Roughly in order of value:
+Done, and verified on the deployed cluster:
 
-- [x] Cluster DNS without kube-proxy — vendored hostNetwork coredns + `--kubelet-arg=cluster-dns=<node IP>`.
-- [x] `exec` / `attach` / `port-forward` through the Worker — WebSocket transport via the DO fetch boundary.
-- [x] Litestream replication of the kine SQLite database to R2 (opt-in, needs an R2 token).
-- [x] Persist the cluster CA across restarts — the CA rides inside the replicated datastore; token + node password pinned by deploy.sh.
-- [x] ClusterIP without kube-proxy — `svcproxy/`, a userspace Service proxy on AnyIP-bound ClusterIPs.
-- [x] R2-backed PersistentVolumes — JuiceFS host mount + a `juicefs-r2` StorageClass, RWX, verified surviving a disk wipe.
-- [x] R2-backed image cache — a separate `kubeflare-registry` Worker (cloudflare/serverless-registry) mirroring docker.io.
-- [x] metrics-server, and therefore `kubectl top` and HPA — it only ever needed working ClusterIPs.
-- [x] An empirical API conformance matrix and suite — [docs/CONFORMANCE.md](docs/CONFORMANCE.md), `conformance/run.sh`.
-- [ ] Bind `kubectl proxy` and the status server to the node IP instead of `0.0.0.0`, so the pod→host firewall guards become belt-and-braces rather than the only defence — and so Services can use ports 8001/8080.
+- [x] ClusterIP Services without kube-proxy — `svcproxy/`, a userspace proxy on AnyIP-bound ClusterIPs.
+- [x] Cluster DNS — vendored hostNetwork coredns, plus a working `kube-dns` ClusterIP.
+- [x] `exec` / `attach` / `port-forward` / `cp` through the Worker over the WebSocket transport.
+- [x] Durable cluster state — Litestream → R2, including cluster identity; survives a full disk wipe in ~30s.
+- [x] R2-backed PersistentVolumes — JuiceFS + a `juicefs-r2` RWX StorageClass, verified across a wipe.
+- [x] R2-backed image cache — the `kubeflare-registry` Worker, mirroring docker.io via `mirror.gcr.io`.
+- [x] metrics-server, so `kubectl top` and HPA work.
 - [x] NodePort Services, reachable from the internet through the Worker.
-- [ ] Source-IP preservation and `sessionAffinity: ClientIP` in svcproxy.
-- [x] `type: LoadBalancer` — `lbcontroller/` provisions a Cloudflare Tunnel hostname + DNS record per Service and publishes it in `.status.loadBalancer.ingress`.
-- [x] R2-backed PersistentVolumes: JuiceFS (host mount, SQLite metadata on the same litestream pipeline) + a `juicefs-r2` StorageClass.
-- [ ] R2-backed image cache: `registry:3` pull-through proxy on the s3 driver, `registries.yaml` mirror — cold boots stop re-pulling from Docker Hub.
-- [ ] WARP private networking: route `10.42.0.0/15` through the tunnel so an enrolled laptop reaches pod/service IPs directly.
-- [ ] `type: LoadBalancer` via a controller that provisions Cloudflare Tunnel public hostnames per Service.
-- [ ] Multi-node: needs a TCP-capable overlay (tunnel mesh or tailscale); blocked on no vxlan + no inbound UDP.
+- [x] `type: LoadBalancer` — `lbcontroller/` provisions a Tunnel hostname + DNS record per Service.
+- [x] An empirical conformance matrix and a runnable suite.
 
-Contributions welcome. The point of the exercise is to find out how much of the Kubernetes API surface can be made to work here.
+Still open, roughly in order of value:
+
+- [ ] **Bind `kubectl proxy` and the status server to the node IP** instead of `0.0.0.0`. Today a pod→host firewall rule is the *only* thing standing between any pod and cluster-admin; binding properly would make that defence-in-depth rather than the whole defence. Also frees ports 8001/8080 for Services.
+- [ ] **Source-IP preservation** and `sessionAffinity: ClientIP` in svcproxy. Backends currently see the node address, which breaks anything keyed on client IP.
+- [ ] **NetworkPolicy** — needs `xt_NFLOG` in the guest kernel, or a userspace/eBPF policy engine. Today it is accepted and silently unenforced, which is the most dangerous gap here.
+- [ ] **Ingress** — a controller would route correctly in-cluster today; its entry point needs the Worker or a Tunnel hostname, exactly like `type: LoadBalancer` now does.
+- [ ] **Raw-TCP LoadBalancer Services** — `lbcontroller` writes `http://` origins; TCP needs a different tunnel ingress scheme.
+- [ ] **WARP private networking** — route `10.42.0.0/15` through the tunnel so an enrolled laptop reaches pod and Service IPs directly.
+- [ ] **Multi-node** — needs a TCP-capable overlay (tunnel mesh, tailscale). Blocked on no vxlan and no inbound UDP.
+
+Kernel wishlist for Cloudflare, in priority order: `xt_NFLOG` (NetworkPolicy),
+`xt_statistic` + `xt_nfacct` (kube-proxy iptables mode), nft `numgen` + `reject`
+(nftables mode), BTF (eBPF dataplanes), `vxlan` (multi-node). Any one of the middle
+three would let a stock kube-proxy run and delete `svcproxy/` entirely.
 
 ## Layout
 

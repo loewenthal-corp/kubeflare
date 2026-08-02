@@ -93,6 +93,23 @@ function tokensMatch(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// Per-isolate auth-failure rate limiter. Not shared across Worker instances,
+// but effective against any single isolate being hammered.
+const AUTH_FAIL_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const AUTH_FAIL_LIMIT = 10;
+const authFailures = new Map<string, { count: number; firstAttempt: number }>();
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = authFailures.get(ip);
+  if (!entry || now - entry.firstAttempt > AUTH_FAIL_WINDOW_MS) {
+    authFailures.set(ip, { count: 1, firstAttempt: now });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > AUTH_FAIL_LIMIT;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -116,9 +133,16 @@ export default {
 
     const header = request.headers.get("Authorization") ?? "";
     const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-    // ?token= is also accepted so the dashboard opens in a browser.
-    const presented = bearer || url.searchParams.get("token") || "";
+    // ?token= is only accepted for the dashboard root; browsers can't send
+    // Authorization headers. All other paths require the Bearer header.
+    const tokenParam = url.pathname === "/" ? url.searchParams.get("token") : null;
+    const presented = bearer || tokenParam || "";
     if (!tokensMatch(presented, guard)) {
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      console.log(`auth failed: ${request.method} ${url.pathname}`);
+      if (checkRateLimit(ip)) {
+        return new Response("too many requests\n", { status: 429 });
+      }
       return new Response("forbidden\n", { status: 403 });
     }
 

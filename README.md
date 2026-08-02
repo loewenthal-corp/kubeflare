@@ -103,6 +103,9 @@ container hostnames are not stable across instances.
 - **`kubectl top` and HorizontalPodAutoscalers**, via a vendored metrics-server. It was only ever disabled because the aggregation layer needs a working ClusterIP.
 - **Admission webhooks**, including your own — the apiserver reaches a webhook's ClusterIP through svcproxy. This is what makes operators and Crossplane installable.
 - **NodePort Services**, including from the internet — see below.
+- **`type: LoadBalancer`** — each Service gets a real public HTTPS hostname via a Cloudflare Tunnel.
+- **Ingress** — Traefik v3, with host and path routing, reachable over public HTTPS.
+- **`sessionAffinity: ClientIP`** — verified: 8 requests from one client all land on one backend, a different client pins elsewhere, and turning it off restores the spread.
 - Most of the API surface, measured rather than assumed: 153 features work across 175 checks. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 - `kubectl` from anywhere: get, create, apply, scale, delete, logs, describe, rollout.
 - Self-healing. A supervisor restarts k3s if it dies, and after a disk wipe the cluster rebuilds itself unattended — or restores itself from R2 if durable state is on.
@@ -116,8 +119,8 @@ Every entry below is a kernel gap, and the kernel takes no modules: there is no 
 | kube-proxy, all four backends | this kernel is missing something for each one (below) — worked around in userspace, see `svcproxy/` |
 | **NetworkPolicy — silently does nothing** | kube-router emits `-j NFLOG` per pod chain and the kernel has no `xt_NFLOG`, so its transactional `iptables-restore` discards the *entire* ruleset. Policies are accepted and never enforced, ingress **and** egress |
 | Raw-TCP LoadBalancer Services | `lbcontroller` writes `http://` origins, so a non-HTTP Service needs a different tunnel ingress scheme |
-| Source IP preservation | svcproxy re-originates connections, so backends see the node address |
-| `sessionAffinity: ClientIP` | not implemented by svcproxy (ignored with a warning) |
+| Source IP preservation (L4) | not a missing kernel feature — every primitive works. It fails on topology: client and backend share the `cni0` bridge, so replies are bridged by MAC and never routed, and the host's transparent socket never sees them. HTTP backends can still read `CF-Connecting-IP` / `X-Forwarded-For` |
+
 | Service ports 8001 / 8080 | the host binds these on `0.0.0.0` (kubectl proxy, status server), so svcproxy cannot bind a ClusterIP on them. Pick another port |
 | `kubectl get --raw <path>` | `--raw` keeps only the *host* from the kubeconfig server URL and drops the `/k8s` prefix, so it hits the Worker dashboard and returns HTTP 200 HTML. Use `--raw /k8s/<path>` |
 | flannel vxlan | `failed to create vxlan device: operation not supported`, hence host-gw |
@@ -414,6 +417,64 @@ HTTP but not WebSockets. And it is restricted to ports 30000-32767: without that
 guard it would be a general "reach any port in the container" primitive, which
 would include the unauthenticated admin proxy on 8001.
 
+## Ingress
+
+`Ingress` works, and the objects you write are ordinary portable Kubernetes — host
+rules, path rules, `pathType: Prefix` and `Exact`, no vendor CRDs.
+
+The controller is Traefik v3, vendored in `container/manifests-optional/traefik-ingress.yaml`
+rather than re-enabled from the k3s bundle, for the usual reason: the packaged copy
+arrives as a HelmChart CR whose values the addon reconciler restores on every boot.
+Traefik over ingress-nginx on four measured counts — that repository is archived (last
+release March 2026), its image is 112.9 MB against Traefik's 54.8 MB, it publishes only
+to `registry.k8s.io` so it would miss the R2 pull-through cache on every cold wake, and
+Traefik is one static Go binary with nothing to ask of a kernel that has no loadable
+modules. It costs 8.8 s of pull and 14 MiB resident.
+
+The entry point needed no special casing. Traefik's own Service is `type: LoadBalancer`,
+so it gets a real public HTTPS hostname the same way anything else does:
+
+```
+$ kubectl -n traefik get svc ingress
+NAME      TYPE           CLUSTER-IP      EXTERNAL-IP                     PORT(S)
+ingress   LoadBalancer   10.43.162.229   ingress-traefik.kubeflare.dev   80:30667/TCP
+```
+
+**One Service is one hostname.** An Ingress can name any host, but the tunnel only
+carries hostnames it has an explicit rule for. To publish under your own host, add one
+more LoadBalancer Service selecting the same pods:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+  namespace: traefik
+  annotations: { kubeflare.io/hostname: shop.kubeflare.dev }
+spec:
+  type: LoadBalancer
+  selector: { app.kubernetes.io/name: traefik }
+  ports: [{ port: 80, targetPort: web }]
+```
+
+cloudflared forwards the original `Host` header unchanged, so Traefik matches the rule
+for it. The name must be exactly one label under the apex — Universal SSL covers
+`kubeflare.dev` and `*.kubeflare.dev` but not `*.anything.kubeflare.dev`, and a deeper
+name gets HTTP 200 with a failed TLS handshake.
+
+Ingress is on whenever `type: LoadBalancer` is, since the same tunnel and zone
+configuration gates both. `INGRESS_ENABLED=0` keeps it off, `1` forces it on.
+
+Three things to know. `spec.tls` is a no-op — TLS terminates at the Cloudflare edge and
+Traefik has no HTTPS listener. Wildcard hosts are refused on purpose: a wildcard tunnel
+rule would swallow every other rule, the apiserver's included. And Traefik needs
+cluster-wide Secret read — not for anything used here, but because its provider blocks
+its first config publish on a Secret informer and serves 404 for everything without it.
+
+Worth knowing: the real client IP survives at L7 even though svcproxy destroys it at L4.
+`CF-Connecting-IP` and `X-Forwarded-For` arrive intact, and `X-Forwarded-Proto` is
+`https`, so scheme-based redirects do not loop.
+
 ## Image cache on R2
 
 Every cold wake starts with an empty containerd store, so image pulls dominate the
@@ -457,9 +518,10 @@ Done, and verified on the deployed cluster:
 Still open, roughly in order of value:
 
 - [ ] **Bind `kubectl proxy` and the status server to the node IP** instead of `0.0.0.0`. Today a pod→host firewall rule is the *only* thing standing between any pod and cluster-admin; binding properly would make that defence-in-depth rather than the whole defence. Also frees ports 8001/8080 for Services.
-- [ ] **Source-IP preservation** and `sessionAffinity: ClientIP` in svcproxy. Backends currently see the node address, which breaks anything keyed on client IP.
-- [ ] **NetworkPolicy** — needs `xt_NFLOG` in the guest kernel, or a userspace/eBPF policy engine. Today it is accepted and silently unenforced, which is the most dangerous gap here.
-- [ ] **Ingress** — a controller would route correctly in-cluster today; its entry point needs the Worker or a Tunnel hostname, exactly like `type: LoadBalancer` now does.
+- [x] `sessionAffinity: ClientIP` in svcproxy.
+- [ ] **Source-IP preservation at L4** is closed as not-achievable here, and the reason is topology rather than a kernel gap — see the table above. HTTP workloads should read `CF-Connecting-IP`. Reopening it would mean PROXY protocol (opt-in per Service, since a backend that is not expecting the header will choke).
+- [ ] **NetworkPolicy** — still accepted and silently unenforced, which remains the most dangerous gap here. A wrapper that strips the `-j NFLOG` rules this kernel cannot take is now installed at the `/etc/alternatives` target, and it helps — policy chains went from 0 to 8 installed — but per-pod chains still do not appear and the same error recurs, so k3s's embedded kube-router is resolving `iptables-restore` by some path that is neither `PATH` nor the alternatives symlink. Finding that path is the next step.
+- [x] Ingress — Traefik v3, entry point via its own `type: LoadBalancer` Service.
 - [ ] **Raw-TCP LoadBalancer Services** — `lbcontroller` writes `http://` origins; TCP needs a different tunnel ingress scheme.
 - [ ] **WARP private networking** — route `10.42.0.0/15` through the tunnel so an enrolled laptop reaches pod and Service IPs directly.
 - [ ] **Multi-node** — needs a TCP-capable overlay (tunnel mesh, tailscale). Blocked on no vxlan and no inbound UDP.

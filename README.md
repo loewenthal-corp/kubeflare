@@ -77,6 +77,10 @@ npx wrangler login
 ./scripts/deploy.sh
 ```
 
+> Pointing an AI agent at this repo? Start it on **[AGENTS.md](AGENTS.md)** — which
+> Cloudflare tokens you need and their exact permissions, the feature gating, and the
+> deploy traps that are invisible from the code.
+
 `deploy.sh` checks your entitlement, generates an access token, builds and pushes the image, waits for the cluster to come up, and writes `kubeconfig.yaml`. Then:
 
 ```bash
@@ -543,6 +547,7 @@ three would let a stock kube-proxy run and delete `svcproxy/` entirely.
 | `src/index.ts` | Worker: API passthrough, gated dashboard, `/healthz` |
 | `scripts/deploy.sh` | One command from zero to a working `kubeconfig.yaml` |
 | `scripts/tunnel-setup.sh` | Automates the Cloudflare Tunnel path end to end (needs an API token) |
+| `AGENTS.md` | Agent/contributor orientation: credentials, permissions, gotchas |
 | `docs/FINDINGS.md` | The full write-up: probe matrix, every error, exact causes |
 | `docs/CONFORMANCE.md` | Empirical API matrix: 153 work, 14 broken, measured not inferred |
 | `conformance/` | The suite behind that matrix — `conformance/run.sh` |

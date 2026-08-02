@@ -69,7 +69,7 @@ type proxyListener struct {
 	key      proxyKey
 	service  string // namespace/name
 	pool     endpointPool
-	affinity affinityTable                // empty and bypassed unless ClientIP affinity is on
+	affinity affinityTable // empty and bypassed unless ClientIP affinity is on
 	log      *slog.Logger
 	udp      atomic.Pointer[udpForwarder] // set while a UDP socket is bound
 

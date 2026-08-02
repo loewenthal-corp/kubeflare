@@ -34,6 +34,9 @@ simply listens on every `ClusterIP:port` and forwards bytes in userspace.
 - For every service with a real ClusterIP (ClusterIP/NodePort/LoadBalancer;
   headless and ExternalName are skipped) and every TCP/UDP port, binds a
   listener on each IPv4 ClusterIP at the service port.
+- NodePort/LoadBalancer services additionally get a listener on the wildcard
+  address at their node port — every node address, which is what NodePort
+  means and what makes it reachable from outside the container.
 - **TCP**: accept → round-robin dial of a ready endpoint (up to 3 attempts,
   5s dial timeout) → bidirectional splice with half-close (`CloseWrite`)
   propagation.
@@ -47,9 +50,10 @@ simply listens on every `ClusterIP:port` and forwards bytes in userspace.
   ports by name — so the default `kubernetes` service (endpoint = host
   IP:6443) flows through the exact same path as everything else.
 - Reconciles the listener set on every change. Endpoint-only changes swap the
-  backend list atomically **without** restarting listeners (UDP sessions to
-  removed backends are dropped immediately); IP/port/protocol changes are a
-  stop+start of that one listener.
+  backend list atomically **without** restarting listeners (UDP sessions and
+  affinity pins to removed backends are dropped immediately); IP/port/protocol
+  changes are a stop+start of that one listener. A `sessionAffinity` change
+  needs neither.
 - A failed bind (route not up yet, host process squatting on the port) is
   retried every 15s. Per-listener errors never take the process down; the
   only fatal error is an unusable kubeconfig.
@@ -139,18 +143,83 @@ for `--setup-route` (and it degrades to a logged error if missing).
 ## Limitations (v1)
 
 - **No source-IP preservation.** Connections are re-originated in userspace,
-  so backends see the node's address (node IP or CNI bridge IP), never the
-  real client. Anything keyed on client IP — NetworkPolicy by source, DNS
-  ACLs, app-level allowlists — sees the node instead.
-- **No session affinity.** `sessionAffinity: ClientIP` is ignored (warned
-  once per service).
-- **No NodePorts.** NodePort/LoadBalancer services are served on their
-  ClusterIP only; the node port itself is never opened.
+  so backends see the node's address (measured: the CNI bridge address
+  `10.42.0.1`), never the real client. Anything keyed on client IP —
+  NetworkPolicy by source, DNS ACLs, app-level allowlists — sees the node
+  instead. This one is not a missing kernel feature; see below.
 - **No SCTP** (skipped with a log line). IPv4 only; IPv6 ClusterIPs are
   skipped.
 - Userspace copy per connection: correctness over throughput. Fine for a
   single-node cluster; do not expect kube-proxy-grade numbers.
 - No metrics yet (TODO: Prometheus).
+
+### Why source-IP preservation is not implemented
+
+Transparent proxying is the standard fix: set `IP_TRANSPARENT` on the
+upstream socket, bind it to the *client's* address, and divert the backend's
+replies back into that socket with a netfilter socket match plus policy
+routing. Every primitive that needs is present and working on this kernel —
+this was measured on the live cluster, not assumed:
+
+| Primitive | Result |
+| --- | --- |
+| `IP_TRANSPARENT` (TCP and UDP) | works |
+| `bind()` to a foreign address | works (`IP_TRANSPARENT` and `IP_FREEBIND` both) |
+| `iptables -t mangle` | present |
+| `-j TPROXY` (`xt_TPROXY`) | works |
+| `-m socket --transparent` (`xt_socket`) | works |
+| `-j MARK` / `-m mark` | works |
+| `ip rule fwmark` + `local default dev lo` | works |
+| nft `tproxy` and `socket` expressions | work |
+| `SO_MARK`, `br_netfilter` (`bridge-nf-call-iptables=1`), `rp_filter=0` | all fine |
+
+It still does not work, and the reason is the **topology**, not the kernel.
+svcproxy runs in the host netns; on this single node the client pod and the
+backend pod are both on the `cni0` bridge. Re-originating to the backend as
+the client is fine — but the backend's reply is then addressed to a peer on
+its own L2 segment, so it is *bridged* straight to the client's veth by
+destination MAC and the host never routes it. Measured end to end:
+
+- The reply frames **do** traverse `mangle PREROUTING` (rule counters
+  increment) and `-m socket --transparent` **does** match — the kernel finds
+  the transparent socket.
+- The packet is delivered to the pod anyway. With a listener in the target
+  pod to remove the RST ambiguity, the pod logged the connection and the
+  host's transparent socket never accepted anything. Marking plus policy
+  routing has no authority over a bridge forwarding decision, and `-j TPROXY`
+  behaves the same way.
+- End to end, a pod client through a transparent proxy fails: the upstream
+  `connect()` times out on the backend's unanswered SYN-ACKs. So enabling
+  this would not merely fail to preserve the address, it would **break the
+  connection**.
+
+The same test with an off-bridge client (a veth-connected netns, which is
+what a routed or NodePort client looks like) succeeds completely, and the
+backend logs the true client address. That case is real but empty here: the
+only off-bridge path into a service is `cloudflared`, which runs on the host
+and originates to `http://<clusterIP>:<port>`, so the internet client's
+address is already gone before svcproxy sees the connection — it survives
+only in cloudflared's `CF-Connecting-IP` header. Preserving what svcproxy
+would see there (`127.0.0.1`/the node address) is worthless, and spoofing a
+loopback source toward a pod is actively harmful.
+
+So the honest options are:
+
+1. **Accept the limitation** — what this does. It is a property of a
+   single-node cluster where every client shares an L2 segment with every
+   backend, not of a missing capability.
+2. **PROXY protocol** for backends that speak it (HAProxy, nginx with
+   `proxy_protocol`, Envoy). svcproxy would prepend a v1/v2 header carrying
+   the real client address. Opt-in per service via annotation, since a
+   backend that does not expect the header will choke on it.
+3. **Application-level headers** (`X-Forwarded-For`) — only for HTTP, and
+   svcproxy is deliberately protocol-blind.
+
+What would *not* be acceptable: rewriting the reply's destination MAC per
+connection with `ebtables`/`nft bridge` (a rule per TCP connection, churning
+at connection rate), or planting static ARP entries for every client inside
+every pod netns. Both fight the bridge instead of the kernel, and both break
+pod-to-pod networking when they go wrong.
 
 ## Manual test recipe
 
@@ -183,6 +252,25 @@ kubectl scale deployment echo --replicas=1
 # svcproxy (with -v) logs "endpoints changed" — no "listener stopped/started" —
 # and curl against $CIP keeps working throughout.
 
-# 7. Cleanup
+# 7. sessionAffinity: ClientIP — same client, same pod, every time
+kubectl scale deployment echo --replicas=2 && kubectl rollout status deployment echo
+kubectl patch svc echo -p '{"spec":{"sessionAffinity":"ClientIP"}}'
+# svcproxy logs: sessionAffinity ClientIP enabled timeout=3h0m0s
+for i in $(seq 8); do curl -s "http://$CIP/"; echo; done   # one pod name, 8 times
+kubectl patch svc echo -p '{"spec":{"sessionAffinity":"None"}}'
+# svcproxy logs: sessionAffinity None, pins cleared
+for i in $(seq 8); do curl -s "http://$CIP/"; echo; done   # alternating again
+
+# A short timeout, to watch a pin idle out rather than waiting three hours:
+kubectl patch svc echo -p '{"spec":{"sessionAffinity":"ClientIP",
+  "sessionAffinityConfig":{"clientIP":{"timeoutSeconds":10}}}}'
+curl -s "http://$CIP/"; echo; sleep 15; curl -s "http://$CIP/"; echo
+# The second call may land on the other pod: the pin expired.
+
+# And a pin must move when its backend does, without disturbing anything else:
+kubectl scale deployment echo --replicas=1   # -v logs "dropped affinity pins to removed backends"
+curl -s "http://$CIP/"; echo                 # the surviving pod, immediately
+
+# 8. Cleanup
 kubectl delete svc/echo deployment/echo   # svcproxy logs "listener stopped"
 ```

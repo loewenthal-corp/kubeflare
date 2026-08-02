@@ -1,0 +1,300 @@
+# Ingress, via Traefik v3 behind a Cloudflare Tunnel hostname.
+#
+# ---------------------------------------------------------------- why Traefik
+# k3s normally ships Traefik and kubeflare disables it (--disable traefik in
+# entrypoint.sh) along with every other packaged addon, because the packaged
+# copy arrives as a HelmChart CR whose values the addon reconciler restores on
+# every boot. This is the vendored replacement, chosen over ingress-nginx on
+# four measured grounds:
+#
+#   1. ingress-nginx is retired. github.com/kubernetes/ingress-nginx is an
+#      ARCHIVED repository (checked: archived=true, last push 2026-03-23, last
+#      release controller-v1.15.1 on 2026-03-19). Traefik shipped v3.7.10 on
+#      2026-07-31. Vendoring a dead controller into a platform's default path is
+#      not a thing to do on purpose.
+#   2. Image size, which here is cold-start latency. Every wake starts with an
+#      empty containerd store and re-pulls. Measured amd64 compressed sizes:
+#      traefik:v3.7.10 = 54.8 MB, ingress-nginx/controller:v1.14.0 = 112.9 MB.
+#   3. Registry. traefik is a Docker Official Image on docker.io, so it is
+#      served by the R2 pull-through cache (REGISTRY_MIRROR_URL, see
+#      entrypoint.sh) — free egress, no Docker Hub anonymous rate limit.
+#      ingress-nginx only publishes to registry.k8s.io, which is not mirrored,
+#      so it would pull from upstream on every single cold wake.
+#   4. Kernel surface. Traefik is one static Go binary doing userspace HTTP
+#      proxying: no iptables, no ipvs, no eBPF, no conntrack tricks. That
+#      matters on a kernel with no loadable modules that is already missing
+#      xt_nfacct, xt_statistic, xt_NFLOG, ip_vs, vxlan and BTF. ingress-nginx
+#      would also have worked (it is a userspace proxy too), but Traefik has
+#      strictly less to go wrong and one process instead of two.
+#
+# ---------------------------------------------------------------- how it is reached
+# The Service below is type: LoadBalancer, so lbcontroller gives it a real
+# public HTTPS hostname automatically: an ingress rule on the shared Cloudflare
+# Tunnel pointing at http://<clusterIP>:80, plus a proxied CNAME. Named
+# "ingress" in namespace "traefik" so the derived hostname reads
+# "ingress-traefik.<LB_HOSTNAME_SUFFIX>" — lbcontroller builds it as
+# "<service>-<namespace>.<suffix>", and this way it needs no annotation and
+# follows whatever suffix is configured.
+#
+# ONE Service is ONE hostname. An Ingress can name any host it likes, but the
+# tunnel only carries hostnames it has an explicit rule for, and Cloudflare's
+# Universal SSL covers <apex> and *.<apex> but NOT *.anything.<apex> — so every
+# public name has to be exactly one label under the apex and has to exist as a
+# tunnel rule. To publish an Ingress under a custom host, add a second
+# LoadBalancer Service selecting these same pods:
+#
+#   apiVersion: v1
+#   kind: Service
+#   metadata:
+#     name: shop            # any name; the annotation is what decides the host
+#     namespace: traefik
+#     annotations:
+#       kubeflare.io/hostname: shop.kubeflare.dev
+#   spec:
+#     type: LoadBalancer
+#     selector: { app.kubernetes.io/name: traefik }
+#     ports: [{ port: 80, targetPort: web }]
+#
+# lbcontroller then publishes shop.kubeflare.dev -> http://<that clusterIP>:80.
+# cloudflared forwards the original Host header unchanged (no httpHostHeader is
+# set on the rule), so Traefik sees Host: shop.kubeflare.dev and matches the
+# Ingress rule for that host. Verified end to end over public HTTPS.
+#
+# ---------------------------------------------------------------- known limits
+#   - spec.tls on an Ingress is a NO-OP. There is no websecure entrypoint, so
+#     Traefik never serves TLS; the edge does. A spec.tls block naming a missing
+#     Secret logs "Error configuring TLS" once per sync and changes nothing —
+#     measured: the same Ingress's HTTP rules kept serving 200 throughout.
+#     Just leave spec.tls out.
+#   - No wildcard host. lbcontroller refuses "*" in kubeflare.io/hostname on
+#     purpose (a wildcard tunnel rule would swallow every other rule, including
+#     the apiserver's), so each public host needs its own alias Service.
+#   - Deleting a LoadBalancer Service while lbcontroller is NOT running will
+#     hang: these Services carry the kubeflare.io/lb-controller finalizer, and
+#     nothing else removes it. That includes `kubectl delete ns traefik`.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: traefik
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traefik
+  namespace: traefik
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflare:traefik-ingress
+rules:
+  # SECURITY NOTE, please read before trimming this: cluster-wide `secrets` read
+  # is genuinely required, and it is the widest privilege this file grants. It
+  # was tested by removing it. Traefik's kubernetesIngress provider starts a
+  # cluster-scoped Secret informer unconditionally and blocks its first
+  # configuration publish on that informer syncing — so without the grant the
+  # controller comes up healthy, passes its own /ping, and serves HTTP 404 for
+  # EVERY route, with only "failed to list *v1.Secret ... forbidden" in the log.
+  # Measured here: all three working routes went to 404 the moment the verb was
+  # dropped, and came back when it was restored.
+  #
+  # Nothing kubeflare uses needs it (Ingress TLS secrets are pointless when TLS
+  # terminates at the Cloudflare edge — see the entryPoints comment); it is
+  # simply a hard startup dependency of the provider. If that blast radius is
+  # unacceptable, the supported way to shrink it is
+  # --providers.kubernetesIngress.namespaces=<list>, which makes Traefik build
+  # per-namespace informers that namespaced RoleBindings can satisfy — at the
+  # cost of Ingress only working in those namespaces.
+  - apiGroups: [""]
+    resources: [services, endpoints, secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  # nodes is not optional even though nothing here uses NodePort. Traefik 3.7
+  # unconditionally starts a Node informer, and without this it retries the
+  # LIST in a tight loop forever: "failed to list *v1.Node: nodes is forbidden".
+  # The controller still routes, but it burns CPU and floods the log on a node
+  # where both are scarce. Found by reading the logs of the first deploy.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, ingressclasses]
+    verbs: [get, list, watch]
+  # ingressEndpoint.publishedService (below) copies this controller's own
+  # LoadBalancer hostname onto every Ingress it serves, so `kubectl get ingress`
+  # shows the real public address instead of an empty ADDRESS column.
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflare:traefik-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflare:traefik-ingress
+subjects:
+  - kind: ServiceAccount
+    name: traefik
+    namespace: traefik
+---
+# Marked default so an Ingress with neither spec.ingressClassName nor the legacy
+# annotation is still served. On a single-controller cluster that is what people
+# expect, and it is what the k3s-packaged Traefik does.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: traefik
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: traefik.io/ingress-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traefik
+  namespace: traefik
+  labels:
+    app.kubernetes.io/name: traefik
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: traefik
+    spec:
+      serviceAccountName: traefik
+      containers:
+        - name: traefik
+          image: traefik:v3.7.10
+          imagePullPolicy: IfNotPresent
+          args:
+            # Nothing phones home from a cluster that wakes and sleeps on a
+            # timer; the version check is also a DNS + HTTP round trip on every
+            # cold start, which is latency for nothing.
+            - --global.checkNewVersion=false
+            - --global.sendAnonymousUsage=false
+            - --log.level=INFO
+            # Ports are deliberately >1024 so the container needs no
+            # NET_BIND_SERVICE and can run as a non-root user; the Service maps
+            # 80 -> web. Neither may be 8001 or 8080 at the *Service* level:
+            # the host binds those on 0.0.0.0 (kubectl proxy, status server) so
+            # svcproxy cannot claim a ClusterIP on them. Inside the pod netns
+            # they would be fine, but keeping them clear of both numbers means
+            # the Service port and the container port can never be confused.
+            - --entryPoints.web.address=:8000
+            - --entryPoints.ping.address=:8082
+            - --ping=true
+            - --ping.entryPoint=ping
+            # TLS is terminated at the Cloudflare edge and cloudflared speaks
+            # plain HTTP to the origin, so there is no websecure entrypoint and
+            # no certificate resolver here. A self-signed :443 listener would be
+            # pure weight: nothing would ever connect to it.
+            #
+            # Consequently the ONLY thing that carries the real scheme is the
+            # X-Forwarded-Proto cloudflared sets. Traefik strips X-Forwarded-*
+            # from untrusted peers, and the peer here is svcproxy dialling from
+            # the host netns, so without this an app that redirects to
+            # X-Forwarded-Proto ends up in an http->https->http loop. The
+            # trade-off is that anything already on the pod network can forge
+            # those headers — which is no worse than the existing posture (see
+            # the security note in README: pods are not a trust boundary here).
+            - --entryPoints.web.forwardedHeaders.trustedIPs=10.0.0.1/32,10.42.0.0/16,10.43.0.0/16
+            # Only the plain Ingress provider. Traefik's own IngressRoute CRDs
+            # are deliberately NOT installed: measured on this cluster, CRDs
+            # cost roughly 3 MiB of apiserver RSS each, and Traefik's set is
+            # about ten of them for a feature nobody asked for. Ingress is the
+            # portable API and it is what this file is for.
+            - --providers.kubernetesIngress=true
+            # Copies this Service's .status.loadBalancer (the public Cloudflare
+            # hostname lbcontroller published) onto every Ingress's status, so
+            # `kubectl get ingress` shows where to actually send a request.
+            - --providers.kubernetesIngress.ingressEndpoint.publishedService=traefik/ingress
+          env:
+            # Same reasoning as coredns: client-go's in-cluster config would
+            # dial the kubernetes.default ClusterIP, which only resolves once
+            # svcproxy has bound it. svcproxy does come up (metrics-server and
+            # Crossplane both reach 10.43.0.1 fine), but this pod is on the boot
+            # path of every wake and there is no reason to make the ingress
+            # control plane wait on the service dataplane. The apiserver's
+            # serving cert carries the node IP as a SAN (verified: "IP Address:
+            # 10.0.0.1"), so the cluster CA in the ServiceAccount volume still
+            # validates it. __NODE_IP__ is substituted by entrypoint.sh at boot.
+            - name: KUBERNETES_SERVICE_HOST
+              value: "__NODE_IP__"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"
+          ports:
+            - name: web
+              containerPort: 8000
+            - name: ping
+              containerPort: 8082
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet: {path: /ping, port: ping}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /ping, port: ping}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            # readOnlyRootFilesystem: true, and Traefik wants a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# The public entry point. type: LoadBalancer is the whole trick: lbcontroller
+# sees it, adds "ingress-traefik.<suffix> -> http://<clusterIP>:80" to the
+# shared tunnel, creates the proxied CNAME, and writes the hostname back into
+# .status.loadBalancer.ingress[0].hostname — from where publishedService above
+# propagates it to every Ingress.
+#
+# Port 80 is spec.ports[0], which is the port lbcontroller publishes (it takes
+# the first port unless kubeflare.io/port says otherwise). Do not add a port
+# before it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress
+  namespace: traefik
+  labels:
+    app.kubernetes.io/name: traefik
+    # To pin a nicer hostname than the derived ingress-traefik.<suffix>, add:
+    #   annotations:
+    #     kubeflare.io/hostname: ingress.kubeflare.dev
+    # It must be exactly one label under the zone apex — Universal SSL does not
+    # cover *.x.kubeflare.dev, and a two-label name gets HTTP 200 with a failed
+    # TLS handshake. Note this only renames THIS entry point; it does not make
+    # Traefik reachable under any other host. See the header comment.
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: traefik
+  ports:
+    - name: web
+      port: 80
+      targetPort: web
+      protocol: TCP

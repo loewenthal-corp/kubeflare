@@ -40,6 +40,8 @@ simply listens on every `ClusterIP:port` and forwards bytes in userspace.
 - **UDP**: per-client-address sessions pinned to one backend, replies sourced
   from the ClusterIP socket, 30s idle expiry, 4096-session cap with
   least-recently-active eviction. DNS works through this.
+- **`sessionAffinity: ClientIP`**: honoured for TCP and UDP, including
+  `sessionAffinityConfig.clientIP.timeoutSeconds` (default 10800). See below.
 - Endpoints come from EndpointSlices (`kubernetes.io/service-name` label),
   Ready condition only (nil counts as ready), slice ports matched to service
   ports by name — so the default `kubernetes` service (endpoint = host
@@ -52,6 +54,41 @@ simply listens on every `ClusterIP:port` and forwards bytes in userspace.
   retried every 15s. Per-listener errors never take the process down; the
   only fatal error is an unusable kubeconfig.
 - Graceful shutdown on SIGTERM/SIGINT: closes all listeners, exits 0.
+
+## Session affinity
+
+`spec.sessionAffinity: ClientIP` pins a client to one backend for
+`spec.sessionAffinityConfig.clientIP.timeoutSeconds` of idleness (the API
+server's default is 10800, three hours).
+
+- Pins are keyed on the **client IP alone**. Keying on `ip:port` would give
+  every connection its own pin, which is the same as no affinity at all.
+- Each listener keeps its own pin table, so affinity is per
+  ClusterIP × port × protocol. One consequence differs from kube-proxy, which
+  hangs affinity off the service port and shares it across paths: a client
+  that reaches the same service on both its ClusterIP and its NodePort can be
+  pinned to a different backend on each.
+- A pin is revalidated on every use. It is honoured only while it is inside
+  the timeout **and** its backend is still in the ready set; either failing
+  re-pins that one client round-robin and leaves every other pin alone. An
+  endpoint set change also prunes pins to departed backends eagerly, the same
+  way UDP sessions are pruned.
+- A failed dial drops the pin before retrying, so an affine client is not
+  retried into the same unreachable backend `dialAttempts` times over.
+- The table is capped at 4096 pins per listener and evicts the
+  least-recently-active entry when full, plus a sweep every 60s. An
+  uncapped map keyed by client IP is a memory leak with a hostile-client
+  shape.
+- TCP and UDP share one table per listener. UDP's own per-`ip:port` session
+  table stays (replies must go back to the right source port); it just takes
+  its backend from the affinity table, so all of one client's source ports
+  land on that client's backend.
+- With `sessionAffinity: None` the affinity table is bypassed entirely and
+  selection is exactly the round-robin `endpointPool.pick` it always was.
+
+Affinity is deliberately **not** part of the listener diff: changing it needs
+no restart and does not invalidate the socket, so it is simply reapplied on
+every reconcile pass and is a no-op unless it moved.
 
 ## How it's wired into kubeflare
 

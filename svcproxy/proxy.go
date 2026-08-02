@@ -66,26 +66,28 @@ func (p *endpointPool) pick() (string, bool) {
 // binding forever: the bind can race the AnyIP route setup or collide with a
 // host process on the same address, and neither may take the process down.
 type proxyListener struct {
-	key     proxyKey
-	service string // namespace/name
-	pool    endpointPool
-	log     *slog.Logger
-	udp     atomic.Pointer[udpForwarder] // set while a UDP socket is bound
+	key      proxyKey
+	service  string // namespace/name
+	pool     endpointPool
+	affinity affinityTable                // empty and bypassed unless ClientIP affinity is on
+	log      *slog.Logger
+	udp      atomic.Pointer[udpForwarder] // set while a UDP socket is bound
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-func startListener(ctx context.Context, key proxyKey, service string, endpoints []string, log *slog.Logger) *proxyListener {
+func startListener(ctx context.Context, key proxyKey, spec listenerSpec, log *slog.Logger) *proxyListener {
 	ctx, cancel := context.WithCancel(ctx)
 	l := &proxyListener{
 		key:     key,
-		service: service,
-		log:     log.With("service", service, "listener", key.String()),
+		service: spec.service,
+		log:     log.With("service", spec.service, "listener", key.String()),
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
-	l.pool.set(endpoints)
+	l.pool.set(spec.endpoints)
+	l.setAffinity(spec.affinity)
 	go l.run(ctx)
 	return l
 }
@@ -98,18 +100,42 @@ func (l *proxyListener) stop() {
 }
 
 // setEndpoints atomically swaps the backend set without restarting the
-// listener. UDP sessions pinned to a vanished backend are dropped so clients
-// re-resolve to a live one instead of blackholing until idle expiry.
+// listener. UDP sessions and ClientIP affinity pins bound to a vanished
+// backend are dropped so those clients re-resolve to a live one instead of
+// blackholing until idle expiry.
 func (l *proxyListener) setEndpoints(eps []string) {
 	l.pool.set(eps)
+	if n := l.affinity.prune(eps); n > 0 {
+		l.log.Debug("dropped affinity pins to removed backends", "count", n)
+	}
 	if f := l.udp.Load(); f != nil {
 		f.prune(eps)
 	}
 }
 
+// setAffinity applies the service's sessionAffinity setting. The controller
+// calls it on every reconcile pass, so it stays silent unless it changed.
+func (l *proxyListener) setAffinity(cfg *affinityConfig) {
+	if !l.affinity.setConfig(cfg) {
+		return
+	}
+	if cfg == nil {
+		l.log.Info("sessionAffinity None, pins cleared")
+	} else {
+		l.log.Info("sessionAffinity ClientIP enabled", "timeout", cfg.timeout)
+	}
+}
+
+// pickFor chooses a backend for one client: the pinned one under ClientIP
+// affinity, the next round-robin backend otherwise.
+func (l *proxyListener) pickFor(clientIP string) (string, bool) {
+	return l.affinity.pick(clientIP, &l.pool)
+}
+
 func (l *proxyListener) run(ctx context.Context) {
 	defer close(l.done)
 	defer l.log.Info("listener stopped")
+	go l.affinity.sweep(ctx) // outlives individual bind attempts, unlike the UDP sweeper
 	for {
 		var err error
 		if l.key.proto == "UDP" {
@@ -155,7 +181,7 @@ func (l *proxyListener) serveTCP(ctx context.Context) error {
 // other, and a mid-stream error tears both directions down.
 func (l *proxyListener) proxyTCP(client *net.TCPConn) {
 	defer client.Close()
-	upstream := l.dialUpstream()
+	upstream := l.dialUpstream(clientIP(client.RemoteAddr()))
 	if upstream == nil {
 		return
 	}
@@ -178,11 +204,13 @@ func halfProxy(dst, src *net.TCPConn) {
 	dst.CloseWrite() // clean EOF from src: propagate the half-close
 }
 
-// dialUpstream tries ready backends in round-robin order, moving to the next
-// on dial failure, up to dialAttempts in total.
-func (l *proxyListener) dialUpstream() *net.TCPConn {
+// dialUpstream tries ready backends for one client, moving to the next on
+// dial failure, up to dialAttempts in total. A failed dial also drops that
+// client's affinity pin, so the retry is a fresh round-robin pick instead of
+// the same unreachable backend three times over.
+func (l *proxyListener) dialUpstream(clientIP string) *net.TCPConn {
 	for i := 0; i < dialAttempts; i++ {
-		backend, ok := l.pool.pick()
+		backend, ok := l.pickFor(clientIP)
 		if !ok {
 			l.log.Debug("no ready endpoints, dropping connection")
 			return nil
@@ -190,10 +218,28 @@ func (l *proxyListener) dialUpstream() *net.TCPConn {
 		conn, err := net.DialTimeout("tcp4", backend, dialTimeout)
 		if err != nil {
 			l.log.Debug("backend dial failed", "backend", backend, "error", err)
+			l.affinity.forget(clientIP, backend)
 			continue
 		}
 		return conn.(*net.TCPConn)
 	}
 	l.log.Warn("all backend dials failed, dropping connection", "attempts", dialAttempts)
 	return nil
+}
+
+// clientIP is the affinity key of a connection: the source address with the
+// port dropped. Keying on ip:port instead would give every connection its own
+// pin, which is the same as having no affinity at all.
+func clientIP(addr net.Addr) string {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return a.IP.String()
+	case *net.UDPAddr:
+		return a.IP.String()
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
 }

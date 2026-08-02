@@ -34,28 +34,27 @@ type controller struct {
 	kick chan struct{} // coalesced change notifications
 
 	// Owned by the run goroutine; no locking needed.
-	running        map[proxyKey]*proxyListener
-	warnedAffinity map[string]bool // service -> warned about ClientIP affinity
-	warnedSCTP     map[string]bool // service:port -> warned about SCTP
+	running    map[proxyKey]*proxyListener
+	warnedSCTP map[string]bool // service:port -> warned about SCTP
 }
 
 // listenerSpec is the desired state of one listener.
 type listenerSpec struct {
-	service   string   // namespace/name, for logs
-	endpoints []string // sorted ready "ip:port" backends
+	service   string          // namespace/name, for logs
+	endpoints []string        // sorted ready "ip:port" backends
+	affinity  *affinityConfig // nil for sessionAffinity: None
 }
 
 func newController(factory informers.SharedInformerFactory, log *slog.Logger) (*controller, error) {
 	svcInf := factory.Core().V1().Services()
 	epsInf := factory.Discovery().V1().EndpointSlices()
 	c := &controller{
-		svcs:           svcInf.Lister(),
-		eps:            epsInf.Lister(),
-		log:            log,
-		kick:           make(chan struct{}, 1),
-		running:        make(map[proxyKey]*proxyListener),
-		warnedAffinity: make(map[string]bool),
-		warnedSCTP:     make(map[string]bool),
+		svcs:       svcInf.Lister(),
+		eps:        epsInf.Lister(),
+		log:        log,
+		kick:       make(chan struct{}, 1),
+		running:    make(map[proxyKey]*proxyListener),
+		warnedSCTP: make(map[string]bool),
 	}
 	h := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { c.poke() },
@@ -129,8 +128,16 @@ func (c *controller) reconcile(ctx context.Context) {
 	}
 	for _, k := range start {
 		s := desired[k]
-		c.running[k] = startListener(ctx, k, s.service, s.endpoints, c.log)
+		c.running[k] = startListener(ctx, k, s, c.log)
 		c.log.Debug("endpoints set", "service", s.service, "listener", k.String(), "endpoints", s.endpoints)
+	}
+	// Affinity is not part of the listener diff: changing it never needs a
+	// restart and never invalidates the socket, so it is simply reapplied
+	// everywhere each pass. setAffinity is a no-op unless it actually moved.
+	for k, s := range desired {
+		if l, ok := c.running[k]; ok {
+			l.setAffinity(s.affinity)
+		}
 	}
 	if len(start)+len(stop)+len(update) > 0 {
 		c.log.Debug("reconciled", "started", len(start), "stopped", len(stop), "updated", len(update), "listeners", len(c.running))
@@ -193,7 +200,6 @@ func (c *controller) desiredState() map[proxyKey]listenerSpec {
 	}
 
 	desired := make(map[proxyKey]listenerSpec)
-	affinityNow := make(map[string]bool)
 	sctpNow := make(map[string]bool)
 	for _, svc := range services {
 		// Headless and ExternalName services have no ClusterIP to serve.
@@ -202,13 +208,9 @@ func (c *controller) desiredState() map[proxyKey]listenerSpec {
 			continue
 		}
 		name := svc.Namespace + "/" + svc.Name
-		if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
-			affinityNow[name] = true
-			if !c.warnedAffinity[name] {
-				c.warnedAffinity[name] = true
-				c.log.Warn("sessionAffinity ClientIP is not supported, ignoring", "service", name)
-			}
-		}
+		// One config shared by every listener of this service, but each
+		// listener keeps its own pin table (see svcproxy/README.md).
+		affinity := clientIPAffinity(svc)
 		ips := svc.Spec.ClusterIPs
 		if len(ips) == 0 {
 			ips = []string{svc.Spec.ClusterIP}
@@ -237,7 +239,7 @@ func (c *controller) desiredState() map[proxyKey]listenerSpec {
 					continue // IPv4 only in v1
 				}
 				desired[proxyKey{ip: ip, port: port.Port, proto: string(proto)}] =
-					listenerSpec{service: name, endpoints: endpoints}
+					listenerSpec{service: name, endpoints: endpoints, affinity: affinity}
 			}
 
 			// NodePort. Bound on the wildcard address rather than a specific one,
@@ -251,17 +253,12 @@ func (c *controller) desiredState() map[proxyKey]listenerSpec {
 			if port.NodePort != 0 &&
 				(svc.Spec.Type == corev1.ServiceTypeNodePort || svc.Spec.Type == corev1.ServiceTypeLoadBalancer) {
 				desired[proxyKey{ip: "", port: port.NodePort, proto: string(proto)}] =
-					listenerSpec{service: name, endpoints: endpoints}
+					listenerSpec{service: name, endpoints: endpoints, affinity: affinity}
 			}
 		}
 	}
 	// Forget warn suppressions for conditions that no longer hold, so they
-	// warn again if they come back and the maps cannot grow without bound.
-	for k := range c.warnedAffinity {
-		if !affinityNow[k] {
-			delete(c.warnedAffinity, k)
-		}
-	}
+	// warn again if they come back and the map cannot grow without bound.
 	for k := range c.warnedSCTP {
 		if !sctpNow[k] {
 			delete(c.warnedSCTP, k)

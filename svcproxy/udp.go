@@ -81,16 +81,25 @@ func (f *udpForwarder) forward(pkt []byte, caddr *net.UDPAddr) {
 	}
 }
 
-// session returns the client's existing session or creates one pinned to the
-// next round-robin backend.
+// session returns the client's existing session or creates one pinned to a
+// backend. The two kinds of pinning compose rather than compete: this table
+// is keyed by client ip:port and exists so replies stay coherent, while the
+// backend it pins to is chosen by pickFor and so obeys ClientIP affinity —
+// every source port of one client lands on that client's affine backend.
+//
+// Lock order is f.mu then affinity.mu, and only ever that way round.
 func (f *udpForwarder) session(caddr *net.UDPAddr) (*udpSession, error) {
 	key := caddr.String()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if s, ok := f.sessions[key]; ok {
+		// An established session never reaches pickFor again, so refresh the
+		// pin here: otherwise a client whose only traffic is one long-lived
+		// flow would let its own pin idle out.
+		f.l.affinity.touch(caddr.IP.String())
 		return s, nil
 	}
-	backend, ok := f.l.pool.pick()
+	backend, ok := f.l.pickFor(caddr.IP.String())
 	if !ok {
 		return nil, errNoEndpoints
 	}

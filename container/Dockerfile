@@ -95,6 +95,45 @@ RUN set -eux; \
     rm /tmp/juicefs.tar.gz; \
     /usr/local/bin/juicefs version
 
+# Make NetworkPolicy work by removing the one rule this kernel cannot take.
+#
+# k3s's kube-router policy controller emits `-j NFLOG` in every per-pod chain,
+# purely to log denied packets. The kernel has no xt_NFLOG, and
+# iptables-restore is transactional — so that one cosmetic rule fails the whole
+# batch and NOT A SINGLE policy rule gets installed. The symptom is the worst
+# kind: NetworkPolicy objects are accepted and silently enforce nothing, in
+# both directions, including deny-all egress.
+#
+# These wrappers drop NFLOG lines from the ruleset on its way to the real
+# binary. What is lost is packet logging; what is gained is every actual
+# ACCEPT/DROP rule. /usr/local/bin precedes /usr/sbin in PATH, so callers get
+# these without knowing.
+COPY container/iptables-restore-wrapper.sh /usr/local/lib/kubeflare-iptables-wrapper
+RUN set -eux; \
+    chmod +x /usr/local/lib/kubeflare-iptables-wrapper; \
+    mkdir -p /usr/local/libexec/xt; \
+    for b in iptables-restore ip6tables-restore; do \
+      link="/etc/alternatives/$b"; \
+      [ -L "$link" ] || continue; \
+      target="$(readlink -f "$link")"; \
+      # argv[0] must stay $b: the target is the xtables multi-call binary.
+      ln -sf "$target" "/usr/local/libexec/xt/$b"; \
+      ln -sf /usr/local/lib/kubeflare-iptables-wrapper "$link"; \
+      ln -sf /usr/local/lib/kubeflare-iptables-wrapper "/usr/local/bin/$b"; \
+    done; \
+    ls -l /usr/local/libexec/xt/ /etc/alternatives/iptables-restore; \
+    # Verify the filter itself. Not `iptables-restore` for real — a Docker build
+    # has no CAP_NET_ADMIN, so that fails for reasons unrelated to this wrapper.
+    # Point the wrapper at `cat` and check NFLOG is what disappears.
+    mv /usr/local/libexec/xt/iptables-restore /usr/local/libexec/xt/iptables-restore.bak; \
+    ln -s /bin/cat /usr/local/libexec/xt/iptables-restore; \
+    out="$(printf -- '-A KEEP -j DROP\n-A DROPME -j NFLOG --nflog-group 100\n' | iptables-restore)"; \
+    echo "$out" | grep -q -- '-A KEEP -j DROP' || { echo "wrapper ate a real rule"; exit 1; }; \
+    echo "$out" | grep -q NFLOG && { echo "wrapper failed to strip NFLOG"; exit 1; }; \
+    echo NFLOG_FILTER_OK; \
+    rm /usr/local/libexec/xt/iptables-restore; \
+    mv /usr/local/libexec/xt/iptables-restore.bak /usr/local/libexec/xt/iptables-restore
+
 COPY --from=lbcontroller-build /out/kubeflare-lbcontroller /usr/local/bin/kubeflare-lbcontroller
 COPY --from=svcproxy-build /out/kubeflare-svcproxy /usr/local/bin/kubeflare-svcproxy
 COPY container/entrypoint.sh /entrypoint.sh

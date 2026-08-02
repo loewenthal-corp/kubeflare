@@ -216,4 +216,29 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    # Bind the node IP rather than 0.0.0.0 when the entrypoint tells us to.
+    #
+    # This endpoint is unauthenticated and serves /kubeconfig and /logs. On
+    # 0.0.0.0 it answered on every address the host holds — including, because
+    # svcproxy installs an AnyIP local route for the whole service CIDR, every
+    # 10.43.x.x. Any pod could read cluster-admin credentials from it. Binding
+    # one address removes that entire class of exposure and additionally frees
+    # port 8080 for ordinary Services, which svcproxy could never bind while
+    # something held the wildcard.
+    #
+    # Cloudflare reaches the container at the node IP (observed in a platform
+    # error: "not listening in the TCP address 10.0.0.1:8001"), so readiness is
+    # unaffected. But readiness is decided by THIS port: if that ever stops
+    # being true the container would never come up, so a failed bind falls back
+    # to the old behaviour loudly rather than leaving the cluster dead.
+    addr = os.environ.get("KUBEFLARE_BIND_ADDR", "").strip() or "0.0.0.0"
+    try:
+        server = ThreadingHTTPServer((addr, 8080), Handler)
+    except OSError as exc:
+        print(f"bind {addr}:8080 failed ({exc}); falling back to 0.0.0.0 —"
+              " pod->host exposure is then only blocked by the INPUT rules",
+              flush=True)
+        addr = "0.0.0.0"
+        server = ThreadingHTTPServer((addr, 8080), Handler)
+    print(f"status server listening on {addr}:8080", flush=True)
+    server.serve_forever()

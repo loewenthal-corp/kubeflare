@@ -13,6 +13,9 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 log() { echo "[entrypoint $(date -u +%T)] $*" | tee -a "$LOG_DIR/entrypoint.log"; }
 
 # ---------------------------------------------------------------- status server
+# Bound to 0.0.0.0 for now because NODE_IP is not known yet and Cloudflare
+# decides readiness on this port — it must be up within seconds. Once NODE_IP is
+# detected the server is restarted bound to just that address; see below.
 python3 /status-server.py >>"$LOG_DIR/status.log" 2>&1 &
 STATUS_PID=$!
 log "status server pid=$STATUS_PID on :8080"
@@ -44,23 +47,21 @@ sysctl -w net.bridge.bridge-nf-call-iptables=1 >>"$LOG_DIR/entrypoint.log" 2>&1 
 # out. The Worker's traffic arrives on the external interface, not cni0, so the
 # real API path is unaffected.
 #
-# Nothing that worked is lost: because these ports are bound on 0.0.0.0, a
-# Service on 8001 or 8080 could never be bound by svcproxy anyway. The proper
-# fix is to bind both listeners to the node IP only (as coredns already does,
-# which is why the kube-dns ClusterIP on :53 works) — that needs the Cloudflare
-# readiness path re-verified, so it is deliberately not done here.
+# Both listeners now bind the node IP rather than 0.0.0.0 (see below), which
+# removes the AnyIP wildcard exposure and frees :8001/:8080 for Services. These
+# rules remain because binding one address does NOT stop a pod: pods route to
+# the node IP perfectly well. Bind = no wildcard; these rules = no pod access.
+# Defence in depth, and each half covers what the other cannot.
 harden_local_ports() {
+  # Scoped to the node IP as the destination, not the port alone. Both
+  # listeners now bind $NODE_IP, so that is the only address worth defending —
+  # and a port-only rule would also drop pod traffic to a *Service* on 8080,
+  # which is a perfectly ordinary thing to want and which now works.
   for p in 8001 8080; do
-    iptables -C INPUT -i cni0 -p tcp --dport "$p" -j DROP 2>/dev/null \
-      || iptables -I INPUT -i cni0 -p tcp --dport "$p" -j DROP 2>/dev/null
+    iptables -C INPUT -i cni0 -p tcp -d "$NODE_IP" --dport "$p" -j DROP 2>/dev/null \
+      || iptables -I INPUT -i cni0 -p tcp -d "$NODE_IP" --dport "$p" -j DROP 2>/dev/null
   done
 }
-# cni0 does not exist yet — flannel creates it after k3s starts. iptables
-# accepts a rule naming an absent interface and matches once it appears, and the
-# supervisor re-asserts these anyway.
-harden_local_ports && log "pod->host :8001/:8080 blocked (cluster-admin proxy, dashboard)" \
-  || log "WARNING: could not install INPUT guards for :8001/:8080"
-
 NODE_NAME="${NODE_NAME:-cf-$(hostname)}"
 TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-}"
 
@@ -75,6 +76,23 @@ if [ -z "$NODE_IP" ]; then
 else
   log "node ip $NODE_IP (cfeth0)"
 fi
+
+# Now that NODE_IP is known, rebind the status server to it alone. Leaving it on
+# 0.0.0.0 means every 10.43.x.x answers with an unauthenticated /kubeconfig,
+# because svcproxy routes the whole service CIDR host-local.
+if [ -n "$NODE_IP" ]; then
+  kill "$STATUS_PID" 2>/dev/null; wait "$STATUS_PID" 2>/dev/null
+  KUBEFLARE_BIND_ADDR="$NODE_IP" python3 /status-server.py >>"$LOG_DIR/status.log" 2>&1 &
+  STATUS_PID=$!
+  log "status server rebound to $NODE_IP:8080 (pid=$STATUS_PID)"
+fi
+
+# Installed here rather than earlier because the rules name $NODE_IP. cni0 does
+# not exist yet either — flannel creates it once k3s starts — but iptables
+# accepts a rule naming an absent interface and matches once it appears, and the
+# supervisor re-asserts these every pass regardless.
+harden_local_ports && log "pod->$NODE_IP:8001/:8080 blocked (cluster-admin proxy, dashboard)" \
+  || log "WARNING: could not install INPUT guards for :8001/:8080"
 
 # ---------------------------------------------------------------- durable state
 # Litestream replicates kine's SQLite DB to R2 and restores it on boot, so the
@@ -440,7 +458,12 @@ start_kproxy() {
       # kubectl proxy ships a default --reject-paths that blocks pods/exec and
       # pods/attach outright (a 403 from the proxy, not from Cloudflare). Clearing
       # it is what makes `kubectl exec` work over this path.
-      /usr/local/bin/k3s kubectl proxy --port=8001 --address=0.0.0.0 \
+      # --address=$NODE_IP, not 0.0.0.0: this proxy holds the node's
+      # cluster-admin kubeconfig and authenticates nobody, and on the wildcard
+      # it answered on every AnyIP-routed 10.43.x.x as well. The INPUT rules
+      # still block pod->node-IP access; this removes the wildcard exposure and
+      # frees :8001 for Services. Cloudflare dials the container on the node IP.
+      /usr/local/bin/k3s kubectl proxy --port=8001 --address="$NODE_IP" \
         --accept-hosts='.*' --accept-paths='.*' --reject-paths='' \
         --api-prefix=/k8s/ \
         >>"$LOG_DIR/kubectl-proxy.log" 2>&1 &
@@ -540,6 +563,24 @@ mkdir -p "$RENDERED"
 for f in /manifests/*.yaml; do
   sed "s/__NODE_IP__/$NODE_IP/g" "$f" > "$RENDERED/$(basename "$f")"
 done
+
+# Ingress (traefik). Its entry point is a type: LoadBalancer Service, which only
+# resolves to a hostname when lbcontroller is running — so without that, this is
+# a 55 MB image pull and a cluster-wide default IngressClass for nothing, plus a
+# public DNS record in your zone that nobody asked for. On iff LoadBalancer is,
+# with an explicit override either way.
+INGRESS_ON=""
+case "${INGRESS_ENABLED:-auto}" in
+  1|true|yes) INGRESS_ON=1 ;;
+  0|false|no) INGRESS_ON="" ;;
+  *) [ -n "${CLOUDFLARE_TUNNEL_API_TOKEN:-}" ] && [ -n "${CF_ACCOUNT_ID:-}" ] \
+     && [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_TUNNEL_ID:-}" ] && INGRESS_ON=1 ;;
+esac
+if [ -n "$INGRESS_ON" ] && [ -f /manifests-optional/traefik-ingress.yaml ]; then
+  sed "s/__NODE_IP__/$NODE_IP/g" /manifests-optional/traefik-ingress.yaml \
+    > "$RENDERED/traefik-ingress.yaml"
+fi
+log "ingress (traefik): $([ -n "$INGRESS_ON" ] && echo enabled || echo disabled)"
 # /manifests-optional is only applied when its precondition holds. The juicefs-r2
 # StorageClass must not exist without the mount behind it: local-path's helper pod
 # hostPaths its volume's parent with DirectoryOrCreate, so provisioning against a
@@ -623,7 +664,7 @@ while true; do
       log "kubectl proxy exited; restarting"
       rm -f "$KPROXY_PIDFILE"; KPROXY_BAD=0
       start_kproxy &
-    elif ! curl -fsS -m 5 -o /dev/null "http://127.0.0.1:8001/k8s/version" 2>/dev/null; then
+    elif ! curl -fsS -m 5 -o /dev/null "http://$NODE_IP:8001/k8s/version" 2>/dev/null; then
       KPROXY_BAD=$((${KPROXY_BAD:-0} + 1))
       # Three consecutive misses (~30s) before acting, and only once the
       # apiserver itself answers, so a slow boot or a brief blip does not send
@@ -646,7 +687,7 @@ while true; do
   fi
   if ! kill -0 "$STATUS_PID" 2>/dev/null; then
     log "status server exited; restarting"
-    python3 /status-server.py >>"$LOG_DIR/status.log" 2>&1 &
+    KUBEFLARE_BIND_ADDR="$NODE_IP" python3 /status-server.py >>"$LOG_DIR/status.log" 2>&1 &
     STATUS_PID=$!
   fi
   if [ -n "${TUNNEL_TOKEN:-}" ] && [ -n "$CFD_PID" ] && ! kill -0 "$CFD_PID" 2>/dev/null; then

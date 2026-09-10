@@ -217,7 +217,7 @@ Cloudflare bills containers per 10ms of active runtime. For the 2 vCPU / 8 GiB /
 
 Call it $2 a day if you leave it running. The Workers Paid plan includes 25 GiB-hours of memory, 375 vCPU-minutes, and 200 GB-hours of disk per month, which covers roughly the first 3 hours of uptime at no cost beyond the $5 base. A demo costs nothing; an always-on cluster is about $65/month.
 
-After `sleepAfter` (2 hours here) the container sleeps and active-runtime billing stops. Sleeping also wipes the disk; the cluster rebuilds itself from the baked-in manifests on the next request, or restores from R2 if durable state is on. R2 adds a few cents a month at the default 10s sync interval.
+`sleepAfter` is still 2 hours, but the Worker schedules a self-wake well before that so the instance (and the `cloudflared` process that holds the Tunnel connector) stays up across idle periods. Without that poke, public hostnames that CNAME at the tunnel have no way to wake a sleeping container. A slept instance is still not billed for active runtime, and still wipes the disk — the cluster rebuilds from the baked-in manifests on the next start, or restores from R2 if durable state is on. R2 adds a few cents a month at the default 10s sync interval.
 
 ## Gotchas
 

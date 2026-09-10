@@ -542,5 +542,4 @@ ClusterIP Services, because Cloudflare's kernel omits three netfilter features.*
 
 Dry-run by default. Re-run with `--yes` to delete the Worker, container application, tunnel, and any
 matching DNS/R2/D1 resources. **The cluster was left running deliberately** so the demo above works —
-it costs roughly $0.08/hour until torn down. The live cluster now self-wakes so the
-Tunnel connector does not die with idle sleep.
+it costs roughly $0.08/hour until torn down or until it sleeps.

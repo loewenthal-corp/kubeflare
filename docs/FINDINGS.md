@@ -419,8 +419,11 @@ For our instance (2 vCPU / 8 GiB / 16 GB):
 The included allotments cover **the first ~3 h 07 m of instance uptime per month at $0** above the $5
 base. A 3-hour demo is free; 24 h continuous is ~$1.55.
 
-Cost control: the container sleeps after `sleepAfter` (set to `2h` here deliberately — a shorter timeout
-wipes the cluster mid-test). A sleeping instance is not billed for active runtime.
+Cost control: `sleepAfter` is still `2h` (a shorter timeout would wipe the cluster mid-test if a
+self-wake failed). The Worker now schedules a recurring wake so the instance does not actually
+sleep — a slept container takes `cloudflared` with it, the Tunnel drops to zero connectors, and
+public DNS that CNAMEs at the tunnel can no longer deliver a request to `/healthz`. A sleeping
+instance is not billed for active runtime.
 
 ---
 

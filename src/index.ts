@@ -1,11 +1,23 @@
 import { Container, getContainer, switchPort } from "@cloudflare/containers";
 
 /**
+ * How often the Durable Object pokes itself so the container never reaches
+ * sleepAfter. Must stay comfortably below 2h: public hostnames CNAME to the
+ * Cloudflare Tunnel, and cloudflared lives only inside this instance, so a
+ * slept container means zero connectors, error 1016 at the edge, and no
+ * inbound request left that can hit /healthz.
+ */
+const WAKE_EVERY_MS = 45 * 60 * 1000;
+
+/**
  * Durable Object that owns the single kubeflare container instance.
  *
- * sleepAfter is deliberately long. The container disk is ephemeral, so an
- * instance that sleeps takes the whole cluster with it and has to rebuild
- * (~90s) on the next request.
+ * sleepAfter is still 2h — a shorter timeout would wipe the cluster mid-test
+ * if a self-wake ever failed to fire. The scheduled wake below is what
+ * actually keeps the instance (and its tunnel connector) up across idle
+ * periods. The schedule is persisted in the DO's container_schedules table,
+ * so it survives Durable Object hibernation the same way the activity timer
+ * does.
  */
 export class KubeFlare extends Container<Env> {
   defaultPort = 8080;
@@ -46,14 +58,46 @@ export class KubeFlare extends Container<Env> {
     R2_BUCKET_JFS: this.env.R2_BUCKET_JFS ?? "",
   };
 
-  override onStart() {
+  override async onStart() {
     console.log("kubeflare container started");
+    // onStart runs on both stopped→running and running→healthy; armWake
+    // refuses to stack a second row.
+    await this.armWake();
   }
+
+  /**
+   * Persistent schedule callback. The SDK deletes the row after it runs, so
+   * we re-arm. renewActivityTimeout is required: a scheduled method does
+   * not count as request activity on its own.
+   */
+  async wake(_payload: Record<string, never>) {
+    console.log("kubeflare self-wake");
+    this.renewActivityTimeout();
+    await this.armWake();
+  }
+
+  /**
+   * Default implementation calls stop(), which is the outage: no process, no
+   * cloudflared, tunnel stays dark, nothing can wake us. Re-arm and leave
+   * the instance running; the SDK renews the activity timer after this hook
+   * returns.
+   */
+  override async onActivityExpired() {
+    console.log("kubeflare activity expired; re-arming wake instead of sleeping");
+    await this.armWake();
+  }
+
   override onStop(params: unknown) {
     console.log("kubeflare container stopped:", JSON.stringify(params));
   }
   override onError(error: unknown) {
     console.log("kubeflare container error:", String(error));
+  }
+
+  private async armWake() {
+    const pending = await this.listSchedules("wake");
+    if (pending.length > 0) return;
+    await this.schedule(new Date(Date.now() + WAKE_EVERY_MS), "wake", {});
   }
 }
 

@@ -128,6 +128,19 @@ interface Env {
 const INSTANCE = "main";
 const STATUS_PORT = 8080;
 const KUBE_PROXY_PORT = 8001;
+const SESSION_COOKIE = "kubeflare_session";
+// 12 hours. The cookie holds sessionVerifier(guard); expiry ends the browser session.
+const SESSION_MAX_AGE = 43200;
+
+const LOGIN_HTML = `<!doctype html>
+<meta charset="utf-8">
+<title>kubeflare login</title>
+<h1>kubeflare</h1>
+<form method="post" action="/login">
+<label>Token <input name="token" type="password" autocomplete="current-password" autofocus required></label>
+<button type="submit">Log in</button>
+</form>
+`;
 
 /** Length-independent compare so the guard token is not probeable by timing. */
 function tokensMatch(a: string, b: string): boolean {
@@ -135,6 +148,35 @@ function tokensMatch(a: string, b: string): boolean {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+/**
+ * What the browser stores. SHA-256 of a fixed prefix plus the guard, hex
+ * encoded, so the cookie cannot be turned back into the cluster-admin token.
+ * Workers Logs keep the request URL, and a query string is not a safe place
+ * for that token.
+ */
+async function sessionVerifier(guard: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("kubeflare-session:" + guard),
+  );
+  const bytes = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+  return hex;
+}
+
+/** First value of `name` in a Cookie header, or "". */
+function cookieValue(cookieHeader: string, name: string): string {
+  const parts = cookieHeader.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return "";
 }
 
 export default {
@@ -158,11 +200,48 @@ export default {
       );
     }
 
+    // Browser login. The token arrives in the POST body, which is not part of
+    // the URL Workers Logs store. A match sets an HttpOnly cookie holding
+    // sessionVerifier(guard) and sends the browser to the dashboard.
+    if (url.pathname === "/login") {
+      if (request.method === "GET") {
+        return new Response(LOGIN_HTML, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+      if (request.method === "POST") {
+        const presented = new URLSearchParams(await request.text()).get("token") ?? "";
+        if (!tokensMatch(presented, guard)) {
+          return new Response("forbidden\n", { status: 403 });
+        }
+        const verifier = await sessionVerifier(guard);
+        return new Response(null, {
+          status: 303,
+          headers: {
+            Location: "/",
+            "Set-Cookie":
+              `${SESSION_COOKIE}=${verifier}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_MAX_AGE}`,
+          },
+        });
+      }
+      return new Response("method not allowed\n", {
+        status: 405,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+
     const header = request.headers.get("Authorization") ?? "";
     const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-    // ?token= is also accepted so the dashboard opens in a browser.
-    const presented = bearer || url.searchParams.get("token") || "";
-    if (!tokensMatch(presented, guard)) {
+    // kubectl sends Authorization. A browser cannot, so it sends the session
+    // cookie from POST /login instead. The query string is ignored because
+    // Workers Logs persist the request URL, and that URL would hold the
+    // cluster-admin credential. When Authorization is present, that header
+    // is the credential that is checked.
+    const session = cookieValue(request.headers.get("Cookie") ?? "", SESSION_COOKIE);
+    const allowed = bearer
+      ? tokensMatch(bearer, guard)
+      : tokensMatch(session, await sessionVerifier(guard));
+    if (!allowed) {
       return new Response("forbidden\n", { status: 403 });
     }
 

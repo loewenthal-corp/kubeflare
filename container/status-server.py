@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote
 
 LOG_DIR = "/var/log/kubeflare"
 K3S = "/usr/local/bin/k3s"
@@ -169,16 +168,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # Default: the whole dashboard.
         #
-        # Every nav link has to carry ?token= forward. The Worker gates all of
-        # these paths, and a browser sends no Authorization header — so a bare
-        # href like /logs/k3s arrives unauthenticated and gets a 403.
-        token = ""
-        if "?" in self.path:
-            token = parse_qs(self.path.split("?", 1)[1]).get("token", [""])[0]
-        q = f"?token={quote(token)}" if token else ""
-
+        # Links stay bare. The Worker authenticates the browser with the
+        # HttpOnly cookie set by POST /login, and the browser attaches it
+        # itself. A ?token= suffix would put the cluster-admin credential in
+        # the URL, which Workers Logs store and the browser keeps in history.
         def nav(href: str, label: str) -> str:
-            return f"<a href='{html.escape(href + q, quote=True)}'>{html.escape(label)}</a>"
+            return f"<a href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
 
         links = " &middot; ".join([
             nav("/logs/k3s", "k3s log"),

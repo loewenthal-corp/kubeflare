@@ -141,7 +141,7 @@ echo
 echo "    export KUBECONFIG=\$PWD/kubeconfig.yaml"
 echo "    kubectl get nodes -o wide"
 echo
-info "Dashboard: $URL/?token=<the token in kubeconfig.yaml>"
+info "Dashboard: $URL/login (log in with the token from kubeconfig.yaml)"
 info "Tear down: ./scripts/teardown.sh --yes"
 echo
 printf '\033[33m%s\033[0m\n' "kubeconfig.yaml holds a cluster-admin token. It's gitignored by default."

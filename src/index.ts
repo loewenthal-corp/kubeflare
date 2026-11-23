@@ -69,10 +69,30 @@ export class KubeFlare extends Container<Env> {
    * Persistent schedule callback. The SDK deletes the row after it runs, so
    * we re-arm. renewActivityTimeout is required: a scheduled method does
    * not count as request activity on its own.
+   *
+   * start() is required because a stopped instance has no cloudflared. The
+   * tunnel then has no connector, and the published hostnames terminate at
+   * the tunnel, so no request can reach this Worker to start it again.
    */
   async wake(_payload: Record<string, never>) {
     console.log("kubeflare self-wake");
+    try {
+      // Already-running is a fast path inside the SDK, and `container` is
+      // private, so there is no running check to make here. Do not wait for
+      // ports: a cold start takes minutes, and onStart/onError report it.
+      await this.start();
+    } catch (error) {
+      console.log(
+        "kubeflare self-wake: start failed, will retry on the next wake",
+        String(error),
+      );
+    }
     this.renewActivityTimeout();
+    // This callback's row is still in container_schedules — the SDK deletes
+    // it only after we return — and listSchedules counts it, so armWake
+    // would no-op. A failed start would then find nothing running and
+    // nothing scheduled, and the alarm loop would drop the cadence.
+    this.deleteSchedules("wake");
     await this.armWake();
   }
 
